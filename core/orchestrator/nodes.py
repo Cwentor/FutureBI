@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import date
 from typing import Any
 
 from agent.heuristic import region_provinces
+from agent.time_utils import parse_explicit_time_window
 from audit.logging import get_logger
 from core.orchestrator import events
 from core.orchestrator.prompts import (
@@ -342,10 +344,22 @@ def planner_node(state: AgentState) -> AgentState:
 # --------------------------------------------------------------------------- #
 # 3) DSLQuery
 # --------------------------------------------------------------------------- #
-def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """诊断问题的确定性两期 DSL 对（基线 = 前 7 天，当前 = 后 7 天，锚 2024-05）。
+def _split_window_midpoint(start_s: str, end_s: str) -> str:
+    """按天数中点把 [start, end) 切成相邻两期（诊断两期对的基线/当前分界）。"""
+    start = date.fromisoformat(start_s)
+    end = date.fromisoformat(end_s)
+    return date.fromordinal((start.toordinal() + end.toordinal()) // 2).isoformat()
 
-    时间锚与评测保持一致（AS_OF 2024-06-30 附近的 5 月窗口，mock 数仓覆盖）。
+
+def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """诊断问题的确定性两期 DSL 对（基线/当前相邻窗口）。
+
+    时间窗口（2026-09 审计修复：无数据诚实原则）：用户显式给出年份/月份时
+    必须尊重——经 ``parse_explicit_time_window`` 解析后按天数中点切成基线/
+    当前两期；未显式给时间才回退 2024-05 缺省锚（评测确定性）。解析出的
+    超界窗口由取数执行前的时间域守卫拦截并如实告知——严禁静默替换成域内
+    窗口（拿 2024 数据回答用户问的 2030 问题 = 数据造假）。
+
     维度口径（审计修复 R2 口径对齐 + M2 维度约束）：两期取数同口径同窗口，
     沙箱直接在行级明细上做总量对比 + 维度归因——明细合计与总量天然同源，
     杜绝总览 66.93 万 vs 拆分 61.68 万式的口径矛盾触发无谓重规划。
@@ -362,6 +376,13 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
     沙箱据此做 GMV = 买家数 × 客单价 的乘法分解，反思器的因子归因诉求
     在首轮即可满足。
     """
+    explicit = parse_explicit_time_window(query)
+    if explicit:
+        baseline_window = {"start": explicit[0], "end": _split_window_midpoint(*explicit)}
+        current_window = {"start": _split_window_midpoint(*explicit), "end": explicit[1]}
+    else:
+        baseline_window = {"start": "2024-05-01", "end": "2024-05-08"}
+        current_window = {"start": "2024-05-08", "end": "2024-05-15"}
     metrics = [
         {"kind": "aggregate", "field": "order_amount", "agg": "sum", "alias": "gmv"},
         {"kind": "aggregate", "field": "order_id", "agg": "count", "alias": "orders"},
@@ -375,7 +396,7 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
             "filters": [{"field": "pay_status", "operator": "eq", "value": "SUCCESS"}],
             "time_filter": {
                 "range_type": "absolute",
-                "absolute": {"start": "2024-05-01", "end": "2024-05-08"},
+                "absolute": dict(baseline_window),
             },
         },
         {
@@ -384,7 +405,7 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
             "filters": [{"field": "pay_status", "operator": "eq", "value": "SUCCESS"}],
             "time_filter": {
                 "range_type": "absolute",
-                "absolute": {"start": "2024-05-08", "end": "2024-05-15"},
+                "absolute": dict(current_window),
             },
         },
     )
@@ -395,14 +416,19 @@ def _scalar_dsl(query: str) -> dict[str, Any]:
 
     与诊断路径严格区分：诊断取两期维度明细 + 驱动因子；标量问题只回答
     "这个数是多少"，多取指标会让"查询答案"式的单值呈现失效。
+    时间窗口同 ``_diagnostic_dsl_pair``：用户显式时间优先，缺省回退
+    2024-05 锚；超界窗口由取数执行前的时间域守卫拦截。
     """
+    explicit = parse_explicit_time_window(query)
+    window = (
+        {"start": explicit[0], "end": explicit[1]}
+        if explicit
+        else {"start": "2024-05-01", "end": "2024-05-15"}
+    )
     return {
         "metrics": [{"kind": "aggregate", "field": "order_amount", "agg": "sum", "alias": "gmv"}],
         "filters": [{"field": "pay_status", "operator": "eq", "value": "SUCCESS"}],
-        "time_filter": {
-            "range_type": "absolute",
-            "absolute": {"start": "2024-05-01", "end": "2024-05-15"},
-        },
+        "time_filter": {"range_type": "absolute", "absolute": window},
     }
 
 
@@ -518,6 +544,30 @@ def _normalize_dsl_draft(dsl: dict[str, Any]) -> dict[str, Any]:
     return d
 
 
+def _outside_domain_window(dsl_payload: dict[str, Any]) -> str | None:
+    """时间域守卫：查询窗口整体晚于数仓数据域上界时返回窗口描述（否则 None）。
+
+    无数据诚实原则（2026-09 审计修复）：此类窗口是确定性必然空集，执行前
+    即拒绝——执行只会得到 0 行，继续因子分解/维度下钻只会产出编造的归因；
+    非法窗口草稿不在此拦截，交由网关校验报错喂回自愈。
+    """
+    from agent.time_utils import time_window_outside_domain
+    from compiler.sql_compiler import resolve_time_window
+    from semantic.dsl_schema import TimeFilter
+
+    tf_payload = dsl_payload.get("time_filter")
+    if not isinstance(tf_payload, dict):
+        return None
+    try:
+        tf = TimeFilter.model_validate(tf_payload)
+        if not time_window_outside_domain(tf):
+            return None
+        start, end = resolve_time_window(tf)
+    except Exception:
+        return None
+    return f"{start:%Y-%m-%d} ~ {end:%Y-%m-%d}"
+
+
 def _run_query_step(state: AgentState, step: PlanStep) -> tuple[AgentState, ToolRecord]:
     """执行单个 query 步骤：DSL -> 门面 -> ParquetRef。
 
@@ -573,10 +623,28 @@ def _run_query_step(state: AgentState, step: PlanStep) -> tuple[AgentState, Tool
 
     notes: list[str] = []
     produced: list[str] = []
+    blocked_windows: list[str] = []
     for i, dsl_payload in enumerate(dsl_variants):
         name = f"{step.id}_v{i}" if len(dsl_variants) > 1 else step.id
         events.emit_tool_start("futurebi_dsl_query", step.id, {"dataset": name, "dsl": dsl_payload})
         started = time.perf_counter()
+        # 时间域守卫（无数据诚实原则）：必然空集的窗口执行前即拒绝，
+        # 严禁拿兜底/域内数据冒充用户指定时段或对空集强行下钻归因
+        blocked = _outside_domain_window(dsl_payload)
+        if blocked:
+            blocked_windows.append(blocked)
+            notes.append(f"{name} 被时间域守卫拦截：查询时间范围 {blocked} 超出数仓数据域")
+            events.emit_tool_end(
+                "futurebi_dsl_query",
+                step.id,
+                ok=False,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                output={
+                    "dataset": name,
+                    "no_data_reason": f"查询时间范围 {blocked} 超出数仓数据域上界",
+                },
+            )
+            continue
         ref = execute_dsl_query(
             dsl_payload,
             principal="admin",  # RLS 主体由服务端身份决定（与 web 链路一致）
@@ -614,10 +682,25 @@ def _run_query_step(state: AgentState, step: PlanStep) -> tuple[AgentState, Tool
         )
 
     # 数据集经 state.datasets 传递（ParquetRef 契约），parquet 产物在 synthesize 汇总
-    summary = f"[{step.id}] 取数完成：{'; '.join(notes)}"
+    all_blocked = bool(blocked_windows) and not produced
+    if all_blocked:
+        windows = "、".join(dict.fromkeys(blocked_windows))
+        no_data_reason = f"查询时间范围 {windows} 超出数仓数据覆盖范围，该时段无任何数据"
+        summary = f"[{step.id}] 取数被时间域守卫拦截：{no_data_reason}"
+    else:
+        no_data_reason = None
+        summary = f"[{step.id}] 取数完成：{'; '.join(notes)}"
     return (
-        state.apply(step_outputs={**state.step_outputs, step.id: produced}),
-        ToolRecord(step_id=step.id, tool="execute_dsl_query", ok=True, summary=summary),
+        state.apply(
+            step_outputs={**state.step_outputs, step.id: produced},
+            no_data_reason=no_data_reason,
+        ),
+        ToolRecord(
+            step_id=step.id,
+            tool="execute_dsl_query",
+            ok=not all_blocked,
+            summary=summary,
+        ),
     )
 
 
@@ -625,6 +708,14 @@ def dsl_query_node(state: AgentState) -> AgentState:
     """取数节点：顺次执行待完成的 query 步骤（需求 §2.A DSLQueryNode）。"""
     updated = state
     for step in [s for s in updated.plan_steps if s.kind == "query" and s.status == "pending"]:
+        if updated.no_data_reason:
+            # 时间域守卫已拦截：域外时段的窗口重取多少次都是必然空集，
+            # 跳过剩余取数步骤（标记 done，无产物），交由 critic 短路诚实报告
+            updated.plan_steps = [
+                s.model_copy(update={"status": "done"}) if s.id == step.id else s
+                for s in updated.plan_steps
+            ]
+            continue
         try:
             updated, record = _run_query_step(updated, step)
             updated.tool_calls.append(record)
@@ -728,6 +819,10 @@ def _analysis_template(state: AgentState, step: PlanStep) -> str:
     inputs = _resolve_step_inputs(state, step)
     if not inputs:
         return _SCALAR_ANALYSIS_TEMPLATE
+    # 空输入纵深防护：依赖数据集全部 0 行 => 输出"无匹配数据"summary，
+    # 严禁在空 DataFrame 上产出假方向/假归因（诚实兜底，配合 critic 短路）
+    if all(int((state.datasets.get(name) or {}).get("rows", 0) or 0) == 0 for name in inputs):
+        return _EMPTY_DATA_ANALYSIS_TEMPLATE
     if "因子" in step.goal or "分解" in step.goal:
         return _factor_template(inputs)
     return _drilldown_template(inputs)
@@ -739,6 +834,22 @@ save_summary(
     metrics={},
     table={"columns": [], "rows": []},
     findings=["本轮无维度明细可取，仅回到取数结果作答。"],
+    extra={},
+)
+"""
+
+# 空输入纵深防护（2026-09 审计修复）：依赖数据集全部 0 行时严禁跑分解/
+# 下钻模板——空 DataFrame 会产出"GMV 从 0.00 变至 0.00"式废话与全 0
+# 归因矩阵，被包装成"分析结论"即数据造假。
+_EMPTY_DATA_ANALYSIS_TEMPLATE = """
+save_summary(
+    title="无匹配数据",
+    metrics={},
+    table={"columns": [], "rows": []},
+    findings=[
+        "输入数据集为空（0 行）：所选时间窗口/过滤条件下没有数据，"
+        "无法开展因子分解或维度归因。"
+    ],
     extra={},
 )
 """
@@ -763,7 +874,7 @@ current_df = read_input("{current_name}")
 b_total = float(baseline_df["gmv"].sum()) if "gmv" in baseline_df.columns else 0.0
 c_total = float(current_df["gmv"].sum()) if "gmv" in current_df.columns else 0.0
 delta = c_total - b_total
-direction = "下滑" if delta < 0 else "增长"
+direction = "下滑" if delta < 0 else ("增长" if delta > 0 else "持平")
 change = delta / b_total if b_total else 0.0
 findings = [
     f"GMV 从 {{b_total:.2f}} 变至 {{c_total:.2f}}，{{direction}} {{abs(change):.1%}}"
@@ -861,7 +972,7 @@ def _dim_label(field):
 b_total = float(baseline_df["gmv"].sum()) if "gmv" in baseline_df.columns else 0.0
 c_total = float(current_df["gmv"].sum()) if "gmv" in current_df.columns else 0.0
 delta = c_total - b_total
-direction = "下滑" if delta < 0 else "增长"
+direction = "下滑" if delta < 0 else ("增长" if delta > 0 else "持平")
 change = delta / b_total if b_total else 0.0
 findings = [
     f"GMV 从 {{b_total:.2f}} 变至 {{c_total:.2f}}，{{direction}} {{abs(change):.1%}}"
@@ -1049,6 +1160,11 @@ def code_exec_node(state: AgentState) -> AgentState:
     """沙箱分析节点：执行 analyze 步骤（需求 §2.A CodeExecutionNode）。"""
     from config import settings
 
+    if state.no_data_reason:
+        # 时间域守卫已拦截取数：无数据可分析，严禁在空数据上跑分解/下钻
+        # 产出编造结论，直接转入反思节点（=> 诚实说明无数据）
+        return state
+
     updated = state
     for step in [s for s in updated.plan_steps if s.kind == "analyze" and s.status == "pending"]:
         code = _analysis_template(updated, step)
@@ -1207,6 +1323,7 @@ _REFLECTOR_OUT_OF_SCOPE_TERMS = (
 
 def _reflector_available_scope() -> str:
     """反思提示词的"数仓可用字段清单"小节（判定边界的客观依据）。"""
+    from config import settings
     from semantic.catalog import COLUMNS
 
     fields = "、".join(sorted(COLUMNS))
@@ -1214,7 +1331,11 @@ def _reflector_available_scope() -> str:
         "# 数仓可用字段清单（判定边界的唯一依据）\n"
         f"{fields}\n"
         "清单之外的业务维度/指标（流量、曝光、活动、投放、库存、物流、竞品等）"
-        "数仓未采集，重规划也取不到，严禁作为 insufficient 的理由。"
+        "数仓未采集，重规划也取不到，严禁作为 insufficient 的理由。\n"
+        "# 数仓数据时间域\n"
+        f"数据覆盖范围截至 {settings.DATA_DOMAIN_END.isoformat()}（数据基准日期）；"
+        "查询时段整体晚于该日期时数仓没有任何数据，属不可执行缺口——"
+        "严禁作为 insufficient 的理由要求重规划，更严禁对空数据推测结论。"
     )
 
 
@@ -1306,6 +1427,24 @@ def critic_node(state: AgentState) -> AgentState:
         w in state.user_query for w in ("为什么", "下滑", "下降", "上涨", "增长", "归因", "原因")
     )
     exhausted = state.error_context.retries >= MAX_RETRIES
+
+    # 无数据诚实短路（2026-09 审计修复，先于一切重规划判定）：
+    # 时间域守卫拦截 / 全部数据集为空（0 行）时，重规划取不回数据域之外的
+    # 数据，严禁空转自愈，直接转入综合节点如实说明无数据。
+    if state.no_data_reason:
+        events.emit_reflection(
+            f"时间域守卫拦截：{state.no_data_reason}",
+            "proceed",
+            "转入综合节点如实说明无数据",
+        )
+        return state.apply(phase="synthesize")
+    if has_data and all(int(ref.get("rows", 0) or 0) == 0 for ref in state.datasets.values()):
+        events.emit_reflection(
+            "全部数据集均为空（0 行）：所选时间窗口/过滤条件下无匹配数据",
+            "proceed",
+            "转入综合节点如实说明无匹配数据",
+        )
+        return state.apply(phase="synthesize")
 
     if not has_data:
         if exhausted:
@@ -1706,6 +1845,44 @@ def _analysis_material(state: AgentState, *, include_trace: bool = True) -> str:
     return "\n\n".join(parts)
 
 
+def _no_data_report(state: AgentState) -> str:
+    """无数据场景的确定性诚实报告（2026-09 审计修复）。
+
+    时间超界 / 全部空集时严禁让 LLM 在空素材上编造"下滑归因"式结论：
+    如实说明原因 + 数据域边界 + 可行动建议，一句话也不能多编。
+    """
+    from config import settings
+
+    lines: list[str] = [f"## 数据说明：{state.user_query}", ""]
+    if state.no_data_reason:
+        lines.append(f"**本次分析无法进行：{state.no_data_reason}。**")
+    else:
+        lines.append(
+            "**本次分析无法进行：查询未命中任何数据（0 行）。**可能原因：过滤条件"
+            "（地区/品类/支付状态等）在所选时间窗口内没有匹配记录。"
+        )
+    lines.append("")
+    lines.append(
+        f"当前数仓的数据覆盖范围截至 {settings.DATA_DOMAIN_END.isoformat()}"
+        "（数据基准日期）。超出该范围的时段没有任何数据，系统不会以其他时段的"
+        "数据代替作答，也不会对空数据推测结论。"
+    )
+    lines.append("")
+    lines.append(
+        "建议：请把分析时段调整到数据覆盖范围内（例如 2024 年 1 月至 6 月），"
+        "或调整过滤条件后重新提问。"
+    )
+    # 质检发现随诚实报告可见（不吞错）：空结果等 DataQA 断言必须向用户呈现，
+    # 小节格式与确定性兜底报告的既有质检小节保持一致
+    for name, ref in state.datasets.items():
+        findings = (ref.get("audit") or {}).get("qa") or []
+        if findings:
+            lines.append("")
+            lines.append(f"**数据质检（{name}）**：")
+            lines.extend(f"- 质检提示（{f['check']}）：{f['message']}" for f in findings)
+    return "\n".join(lines)
+
+
 def synthesize_node(state: AgentState) -> AgentState:
     """综合节点：执行轨迹 + 产物 => 商业分析师口径的 Markdown 报告。
 
@@ -1737,6 +1914,19 @@ def synthesize_node(state: AgentState) -> AgentState:
         events.emit_event(
             events.EVENT_ARTIFACT_EMIT,
             {"artifact": {"type": "markdown_report", "title": "分析简报", "content": report}},
+        )
+        return state.apply(report=report, phase="done")
+
+    # 无数据诚实报告（2026-09 审计修复）：时间超界 / 全部空集时跳过 LLM
+    # 综合——空素材上的"商业分析师报告"只能是编造，确定性话术如实说明
+    empty_all = bool(state.datasets) and all(
+        int(ref.get("rows", 0) or 0) == 0 for ref in state.datasets.values()
+    )
+    if state.no_data_reason or empty_all:
+        report = _no_data_report(state)
+        events.emit_event(
+            events.EVENT_ARTIFACT_EMIT,
+            {"artifact": {"type": "markdown_report", "title": "数据说明", "content": report}},
         )
         return state.apply(report=report, phase="done")
 

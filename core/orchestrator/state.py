@@ -124,6 +124,13 @@ class AgentState(BaseModel):
     # 上次因 LLM 反思触发重规划时的产物进展指纹（重规划无进展护栏）：
     # 指纹不变说明重规划未带来任何新数据/新分析，必须停止空转。
     last_replan_fingerprint: str = ""
+    # 无数据诚实守卫（2026-09 审计修复）：取数执行前的时间域守卫拦截原因
+    # （查询窗口整体晚于数仓数据域上界 = 必然空集）。置位后 analyze/critic
+    # 直接短路到 synthesize 的"如实说明无数据"报告——严禁重规划空转、
+    # 严禁拿兜底窗口数据冒充用户指定时段、严禁对空集编造归因结论。
+    no_data_reason: str | None = Field(
+        default=None, description="时间域守卫拦截原因（无数据诚实报告）"
+    )
     iteration: int = Field(default=0, ge=0, description="图迭代步数（防死循环护栏）")
 
     def apply(self, **updates: Any) -> AgentState:
