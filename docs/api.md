@@ -25,7 +25,7 @@ python -m web.server 8000
 | `/api/settings/providers/test` | POST | 连通性探测（极小 ping 请求，返回 HTTP 200 + 延时） |
 | `/api/settings/providers/<id>/reveal` | POST | 查看已保存的真实 API Key（显式动作，记审计日志） |
 | `/api/schema/summary` | GET | 语义目录摘要：按物理表分组的可查询字段清单（知识上下文） |
-| `/static/` | GET | 双栏工作台前端 |
+| `/static/` | GET | 三栏工作台前端（侧边栏 / 对话 / 执行流程） |
 
 ## 查询示例
 
@@ -60,7 +60,7 @@ curl -X POST http://127.0.0.1:8000/api/query \
 | `tool_start` / `tool_end` | `tool: {name, input, output, duration_ms, error}` | 工具手风琴（DSL/沙箱代码展开） |
 | `reflection` | `reflection: {observation, decision, reason}` | 反思/自愈节点 |
 | `hitl_request` | `hitl: {question, resume_token}` | 澄清交互卡（可点击答复） |
-| `artifact_emit` | `artifact: {type, title, content}` | 右栏画布（报告/图表/代码/数据表） |
+| `artifact_emit` | `artifact: {type, title, content}` | 产物入账（报告/图表/代码/数据表，侧边栏徽标计数） |
 | `done` / `error` | `report` / `error` | 终态收尾（状态灯复位） |
 
 查询参数：`query`（必填）、`human_reply` + `resume_token`（HITL 恢复）、
