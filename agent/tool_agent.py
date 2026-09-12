@@ -775,12 +775,9 @@ def empty_result_reason(dsl: Any) -> str | None:
     tf = getattr(dsl, "time_filter", None)
     if tf is not None:
         try:
-            from compiler.sql_compiler import resolve_time_window
+            from agent.time_utils import time_window_outside_domain
 
-            start, _end = resolve_time_window(tf)
-            # 数据域上界：数仓最后一条订单日期为 2024-06-30（评测锚点），半开区间比较
-            domain_end = datetime(2024, 7, 1, 0, 0, 0)
-            if start >= domain_end:
+            if time_window_outside_domain(tf):
                 return _DATA_DOMAIN_TIP
         except Exception:  # 归因失败不阻塞话术兜底
             pass

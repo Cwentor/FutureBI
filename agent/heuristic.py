@@ -24,6 +24,7 @@ from typing import Any
 
 from agent.clarify import undefined_metric_terms
 from agent.errors import PipelineError
+from agent.time_utils import parse_explicit_time_window
 from config import settings
 from security.errors import SecurityError
 from security.scope import scoped_fields
@@ -559,26 +560,14 @@ class DeterministicNL2DSL:
     # 时间
     # ------------------------------------------------------------------ #
     def _time_filter(self, q: str) -> dict[str, Any] | None:
-        # 绝对：2024年6月 / 2024年
-        m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月", q)
-        if m:
-            year, month = int(m.group(1)), int(m.group(2))
-            end_year, end_month = (year + 1, 1) if month == 12 else (year, month + 1)
+        # 绝对：2024年6月 / 2024年（解析单一实现于 agent.time_utils，编排兜底同源）
+        window = parse_explicit_time_window(q)
+        if window:
+            start, end = window
             return {
                 "granularity": "day",
                 "range_type": "absolute",
-                "absolute": {
-                    "start": f"{year:04d}-{month:02d}-01",
-                    "end": f"{end_year:04d}-{end_month:02d}-01",
-                },
-            }
-        m = re.search(r"(\d{4})\s*年", q)
-        if m:
-            year = int(m.group(1))
-            return {
-                "granularity": "day",
-                "range_type": "absolute",
-                "absolute": {"start": f"{year:04d}-01-01", "end": f"{year + 1:04d}-01-01"},
+                "absolute": {"start": start, "end": end},
             }
 
         # 相对：上个月 / 这个月 / 过去N天 / 过去N个月 / 过去半年 / 季度 / 至今（MTD/QTD/YTD）
