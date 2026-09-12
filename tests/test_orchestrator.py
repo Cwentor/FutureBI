@@ -325,3 +325,185 @@ def test_critic_trace_digest_carries_error_history(monkeypatch):
     nodes.critic_node(state)
     assert "自愈错误记录" in captured["user"]
     assert "NameError" in captured["user"]
+
+
+# --------------------------------------------------------------------------- #
+# 重规划数据集归属（回归锚点：跨轮次错配 -> 假下滑结论）
+# --------------------------------------------------------------------------- #
+def test_resolve_step_inputs_follows_dependency_not_dict_order():
+    """analyze 输入必须取自依赖步骤的本轮产出，而不是 datasets 字典首尾。
+
+    回归锚点：此前按 list(state.datasets)[0]/[-1] 取两期输入，重规划后
+    datasets 累积上轮键，首尾会指向上轮遗留数据集，产出"下滑 57.9%"式错配。
+    """
+    from core.orchestrator.nodes import _resolve_step_inputs
+    from core.orchestrator.state import AgentState, PlanStep
+
+    state = AgentState(user_query="分析 5 月 GMV 下滑原因")
+    state = state.apply(
+        datasets={
+            "s1_v0": {"path": "a.parquet", "rows": 8, "columns": ["province", "gmv"]},
+            "s1_v1": {"path": "b.parquet", "rows": 8, "columns": ["province", "gmv"]},
+        },
+        step_outputs={"s1": ["s1_v0", "s1_v1"]},
+        plan_steps=[
+            PlanStep(id="s1", goal="取两期明细", kind="query"),
+            PlanStep(id="s2", goal="归因", kind="analyze", depends_on=["s1"]),
+        ],
+    )
+    assert _resolve_step_inputs(state, state.plan_steps[1]) == ["s1_v0", "s1_v1"]
+
+
+def test_resolve_step_inputs_ignores_stale_datasets_from_prior_round():
+    """重规划后 datasets 含上轮遗留键时，必须只读本轮依赖产出（不复用旧键）。"""
+    from core.orchestrator.nodes import _resolve_step_inputs
+    from core.orchestrator.state import AgentState, PlanStep
+
+    state = AgentState(user_query="分析 5 月 GMV 下滑原因")
+    # 上轮遗留 s1/s2/s3，本轮 s1 覆盖为 s1_v0/s1_v1
+    state = state.apply(
+        datasets={
+            "s1": {"path": "old1.parquet", "rows": 8, "columns": ["province", "gmv"]},
+            "s2": {"path": "old2.parquet", "rows": 8, "columns": ["province", "gmv"]},
+            "s3": {"path": "old3.parquet", "rows": 8, "columns": ["province", "gmv"]},
+            "s1_v0": {"path": "new0.parquet", "rows": 8, "columns": ["province", "gmv"]},
+            "s1_v1": {"path": "new1.parquet", "rows": 8, "columns": ["province", "gmv"]},
+        },
+        step_outputs={"s1": ["s1_v0", "s1_v1"]},
+        plan_steps=[
+            PlanStep(id="s1", goal="取两期明细", kind="query"),
+            PlanStep(id="s2", goal="归因", kind="analyze", depends_on=["s1"]),
+        ],
+    )
+    assert _resolve_step_inputs(state, state.plan_steps[1]) == ["s1_v0", "s1_v1"]
+
+
+def test_diagnostic_dsl_pair_carries_driver_factor_metrics():
+    """诊断兜底两期对必须同时带订单量与买家数因子（反思归因诉求首轮即满足）。"""
+    from core.orchestrator.nodes import _diagnostic_dsl_pair
+
+    base, curr = _diagnostic_dsl_pair("分析 5 月第一周比第二周 GMV 下滑原因")
+    for dsl in (base, curr):
+        aliases = {m["alias"] for m in dsl["metrics"]}
+        assert {"gmv", "orders", "buyers"} <= aliases
+
+
+# --------------------------------------------------------------------------- #
+# 反思护栏（回归锚点：不可执行缺口 / 计划无进展 -> 禁止空转重规划）
+# --------------------------------------------------------------------------- #
+def _critic_state(**overrides):
+    """构造带 summary 产物的诊断状态（默认产物列为 gmv/orders/buyers）。"""
+    from core.orchestrator.state import AgentState, Artifact
+
+    state = AgentState(user_query="分析一下 2024 年 5 月第一周比第二周 GMV 下滑的原因，按地区定位")
+    defaults = {
+        "datasets": {
+            "s1_v0": {
+                "path": "a.parquet",
+                "rows": 8,
+                "columns": ["province", "gmv", "orders", "buyers"],
+            }
+        },
+        "artifacts": [Artifact(kind="summary", name="s2", payload={"summary": {"title": "归因"}})],
+    }
+    defaults.update(overrides)
+    return state.apply(**defaults)
+
+
+def test_reflector_scope_lists_available_fields():
+    """反思提示词必须携带数仓可用字段清单（判定边界的客观依据）。"""
+    from core.orchestrator.nodes import _reflector_available_scope
+
+    scope = _reflector_available_scope()
+    assert "数仓可用字段清单" in scope
+    assert "order_amount" in scope and "province" in scope
+    assert "流量" in scope  # 明示清单外概念不得作为重规划理由
+
+
+def test_guard_rejects_out_of_scope_reasons():
+    """反思以数仓未采集的维度（流量/活动/异常单）为由判不充分 => 不可执行。"""
+    import core.orchestrator.nodes as nodes
+
+    verdict = {
+        "verdict": "insufficient",
+        "reasons": ["缺少对订单量、客单价、流量、活动、异常单等影响因素的归因分析"],
+    }
+    assert nodes._insufficient_is_actionable(verdict, _critic_state()) is False
+
+
+def test_guard_rejects_when_reasons_all_covered_by_products():
+    """理由提到的概念已被本轮产物覆盖 => 属分析深度诉求，不可执行。"""
+    import core.orchestrator.nodes as nodes
+
+    verdict = {
+        "verdict": "insufficient",
+        "reasons": ["最终结果只列出下降幅度较大的地区及指标，未解释具体下滑原因"],
+        "missing": ["缺少订单量与买家数的归因分析"],
+    }
+    assert nodes._insufficient_is_actionable(verdict, _critic_state()) is False
+
+
+def test_guard_allows_actionable_gap_within_scope():
+    """理由指向可用域内尚未取到的数据（如品类）=> 可执行，允许重规划。"""
+    import core.orchestrator.nodes as nodes
+
+    verdict = {
+        "verdict": "insufficient",
+        "reasons": ["未按品类拆分下滑贡献，无法定位品类级主因"],
+        "missing": ["取品类维度的两期明细"],
+    }
+    # 产物列为 province/gmv/orders/buyers，品类字段未取到 => 可执行
+    assert nodes._insufficient_is_actionable(verdict, _critic_state()) is True
+
+
+def test_guard_rejects_when_replan_makes_no_progress():
+    """产物指纹与上次重规划相同 => 重规划无进展，直接综合（防空转）。"""
+    import core.orchestrator.nodes as nodes
+
+    state = _critic_state()
+    state = state.apply(last_replan_fingerprint=nodes._artifact_fingerprint(state))
+    verdict = {
+        "verdict": "insufficient",
+        "reasons": ["未按品类拆分下滑贡献"],
+        "missing": ["取品类维度明细"],
+    }
+    assert nodes._insufficient_is_actionable(verdict, state) is False
+
+
+def test_critic_guard_converts_unsatisfiable_replan_to_synthesize(monkeypatch):
+    """LLM 反思判定不充分但缺口不可执行时，critic 直接转综合（不空烧重试）。"""
+    import core.orchestrator.nodes as nodes
+
+    monkeypatch.setattr(nodes, "_resolve_llm", lambda: object())
+    monkeypatch.setattr(
+        nodes,
+        "_llm_json",
+        lambda llm, system, user: {
+            "verdict": "insufficient",
+            "reasons": ["缺少对订单量、客单价、流量、活动、异常单等影响因素的归因分析"],
+        },
+    )
+    out = nodes.critic_node(_critic_state())
+    assert out.phase == "synthesize"
+    assert out.error_context.retries == 0  # 未消耗重试额度（非空转重规划）
+
+
+def test_critic_replans_and_records_progress_fingerprint(monkeypatch):
+    """缺口可执行时照常重规划，并记录本轮产物指纹供下轮无进展判定。"""
+    import core.orchestrator.nodes as nodes
+
+    monkeypatch.setattr(nodes, "_resolve_llm", lambda: object())
+    monkeypatch.setattr(
+        nodes,
+        "_llm_json",
+        lambda llm, system, user: {
+            "verdict": "insufficient",
+            "reasons": ["未按品类拆分下滑贡献"],
+            "missing": ["取品类维度明细"],
+        },
+    )
+    state = _critic_state()
+    out = nodes.critic_node(state)
+    assert out.phase == "plan"
+    assert out.error_context.retries == 1
+    assert out.last_replan_fingerprint == nodes._artifact_fingerprint(state)

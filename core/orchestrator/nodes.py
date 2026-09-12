@@ -31,6 +31,7 @@ from core.orchestrator import events
 from core.orchestrator.prompts import (
     DEGRADED_SUMMARIZER_SYSTEM,
     PLANNER_SYSTEM,
+    REFLECTOR_SYSTEM,
     SYNTHESIZER_SYSTEM,
     planner_prompt,
 )
@@ -250,12 +251,21 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
     附省份维度拆分（审计修复 R2 口径对齐）：两期取数同口径同窗口，沙箱
     直接在行级明细上做总量对比 + 分省归因——明细合计与总量天然同源，
     杜绝总览 66.93 万 vs 拆分 61.68 万式的口径矛盾触发无谓重规划。
+
+    驱动因子随取数一并落库（回归锚点：此前只取 GMV 单指标，反思器看到
+    "缺订单量/客单价/流量归因"就判不充分，重规划又取同一份数据，空转至
+    额度耗尽降级）：订单量 orders 与买家数 buyers 与 GMV 同源同窗口，
+    沙箱据此做 GMV = 买家数 × 客单价 的乘法分解，反思器的因子归因诉求
+    在首轮即可满足。
     """
+    metrics = [
+        {"kind": "aggregate", "field": "order_amount", "agg": "sum", "alias": "gmv"},
+        {"kind": "aggregate", "field": "order_id", "agg": "count", "alias": "orders"},
+        {"kind": "aggregate", "field": "user_id", "agg": "count_distinct", "alias": "buyers"},
+    ]
     return (
         {
-            "metrics": [
-                {"kind": "aggregate", "field": "order_amount", "agg": "sum", "alias": "gmv"}
-            ],
+            "metrics": [dict(m) for m in metrics],
             "dimensions": [{"field": "province"}],
             "filters": [{"field": "pay_status", "operator": "eq", "value": "SUCCESS"}],
             "time_filter": {
@@ -264,9 +274,7 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
             },
         },
         {
-            "metrics": [
-                {"kind": "aggregate", "field": "order_amount", "agg": "sum", "alias": "gmv"}
-            ],
+            "metrics": [dict(m) for m in metrics],
             "dimensions": [{"field": "province"}],
             "filters": [{"field": "pay_status", "operator": "eq", "value": "SUCCESS"}],
             "time_filter": {
@@ -275,6 +283,22 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
             },
         },
     )
+
+
+def _scalar_dsl(query: str) -> dict[str, Any]:
+    """非诊断问题的确定性单期总量 DSL（标量问题附维度与因子无意义）。
+
+    与诊断路径严格区分：诊断取两期分省明细 + 驱动因子；标量问题只回答
+    "这个数是多少"，多取指标会让"查询答案"式的单值呈现失效。
+    """
+    return {
+        "metrics": [{"kind": "aggregate", "field": "order_amount", "agg": "sum", "alias": "gmv"}],
+        "filters": [{"field": "pay_status", "operator": "eq", "value": "SUCCESS"}],
+        "time_filter": {
+            "range_type": "absolute",
+            "absolute": {"start": "2024-05-01", "end": "2024-05-15"},
+        },
+    }
 
 
 def _inherit_overview_scope(
@@ -425,9 +449,7 @@ def _run_query_step(state: AgentState, step: PlanStep) -> tuple[AgentState, Tool
             baseline_dsl, current_dsl = _diagnostic_dsl_pair(state.user_query)
             dsl_variants = [baseline_dsl, current_dsl]
         else:
-            overview = json.loads(json.dumps(_diagnostic_dsl_pair(state.user_query)[0]))
-            overview.pop("dimensions", None)
-            dsl_variants = [overview]
+            dsl_variants = [_scalar_dsl(state.user_query)]
 
     # 维度拆分步骤 => 口径继承（数据清洗与对齐层，R2）
     has_dimensions = step.dsl is not None and bool(step.dsl.get("dimensions"))
@@ -445,6 +467,7 @@ def _run_query_step(state: AgentState, step: PlanStep) -> tuple[AgentState, Tool
             )
 
     notes: list[str] = []
+    produced: list[str] = []
     for i, dsl_payload in enumerate(dsl_variants):
         name = f"{step.id}_v{i}" if len(dsl_variants) > 1 else step.id
         events.emit_tool_start("futurebi_dsl_query", step.id, {"dataset": name, "dsl": dsl_payload})
@@ -457,6 +480,7 @@ def _run_query_step(state: AgentState, step: PlanStep) -> tuple[AgentState, Tool
             query=state.user_query,
         )
         state.datasets[name] = ref.model_dump(by_alias=True)
+        produced.append(name)
         notes.append(f"{name}: {ref.rows} 行 × {len(ref.columns)} 列")
         # DataQA/Guardrail 审计面（行动项 1/2）：结构化发现随事件下发前端，
         # QA 发现摘要并入 notes（=> record.summary => critic 反思视野）
@@ -486,7 +510,10 @@ def _run_query_step(state: AgentState, step: PlanStep) -> tuple[AgentState, Tool
 
     # 数据集经 state.datasets 传递（ParquetRef 契约），parquet 产物在 synthesize 汇总
     summary = f"[{step.id}] 取数完成：{'; '.join(notes)}"
-    return state, ToolRecord(step_id=step.id, tool="execute_dsl_query", ok=True, summary=summary)
+    return (
+        state.apply(step_outputs={**state.step_outputs, step.id: produced}),
+        ToolRecord(step_id=step.id, tool="execute_dsl_query", ok=True, summary=summary),
+    )
 
 
 def dsl_query_node(state: AgentState) -> AgentState:
@@ -549,21 +576,52 @@ def dsl_query_node(state: AgentState) -> AgentState:
 # --------------------------------------------------------------------------- #
 # 4) CodeExec（沙箱分析）
 # --------------------------------------------------------------------------- #
+def _resolve_step_inputs(state: AgentState, step: PlanStep) -> list[str]:
+    """解析 analyze 步骤的输入数据集名（按依赖步骤归属，禁用首尾取数）。
+
+    规则（确定性、可解释）：
+    - 有 depends_on：按声明顺序取各依赖步骤本轮产出的数据集名
+      （``state.step_outputs``，重规划时按同 id 覆盖 => 只含本轮产物）；
+    - 无 depends_on：回落到"本计划全部 query 步骤的产出"（顺序稳定）；
+    - 两者皆空：回落到 datasets 的插入顺序（兜底不空转）。
+
+    回归锚点：此前按 ``list(state.datasets)[0]`` / ``[-1]`` 取两期输入，
+    重规划后 datasets 累积上轮键，首尾会指向上轮遗留数据集（如第一轮
+    分省明细 + 第二轮第二周），产出"下滑 57.9%"式的错配结论。
+    """
+    names: list[str] = []
+    for dep in step.depends_on:
+        for name in state.step_outputs.get(dep, []):
+            if name in state.datasets and name not in names:
+                names.append(name)
+    if not names:
+        for query_step in state.plan_steps:
+            if query_step.kind != "query" or query_step.id == step.id:
+                continue
+            for name in state.step_outputs.get(query_step.id, []):
+                if name in state.datasets and name not in names:
+                    names.append(name)
+    if not names:
+        names = list(state.datasets.keys())
+    return names
+
+
 def _analysis_template(state: AgentState, step: PlanStep) -> str:
     """analyze 步骤的代码来源优先级：LLM Coder 产码（已静态校验）> 确定性技能模板。
 
-    模板把 datasets 中的两期分省明细读入，完成总量对比 + 分省加法归因
-    （Δ、贡献占比、主要矛盾省份）+ 分省对比 ECharts——综合节点的
+    模板把本步骤依赖的取数产物（两期分省明细）读入，完成总量对比 + 分省
+    加法归因（Δ、贡献占比、主要矛盾省份）+ 分省对比 ECharts——综合节点的
     "驱动因素分析/区域归因定位"段直接消费该产物。
     """
     if step.code:
         return step.code
-    dataset_names = list(state.datasets.keys())
-    baseline_name = dataset_names[0] if dataset_names else ""
-    current_name = dataset_names[-1] if dataset_names else ""
+    inputs = _resolve_step_inputs(state, step)
+    baseline_name = inputs[0] if inputs else ""
+    current_name = inputs[1] if len(inputs) > 1 else (inputs[0] if inputs else "")
     return f"""
 import pandas as pd
 import json
+import math
 
 baseline_df = read_input("{baseline_name}")
 current_df = read_input("{current_name}")
@@ -614,7 +672,74 @@ if "province" in baseline_df.columns and "province" in current_df.columns:
 else:
     findings.append("两期数据缺少省份维度列，无法做分省归因定位")
 
-save_summary(title="两期对比与分省归因", metrics=metrics, table=table, findings=findings)
+# —— 驱动因子分解（GMV = 买家数 × 人均订单数 × 客单价，对数链式归因）——
+# 反思器会检查"订单量/客单价/买家数等驱动因素"是否被归因；取数阶段已把
+# orders/buyers 与 GMV 同源落库，此处直接做乘法分解，避免"有数据未分析"
+# 触发无谓重规划（重规划只会取回同一份数据）。
+factor_table = {{"columns": ["factor", "baseline", "current", "change_rate", "share"], "rows": []}}
+factor_metrics = {{}}
+if all(col in baseline_df.columns and col in current_df.columns for col in ("orders", "buyers")):
+
+    def _driver_factors(frame):
+        # 把一期明细聚合为乘法因子组（买家数 × 人均订单数 × 客单价 = GMV）
+        gmv_sum = float(frame["gmv"].sum())
+        orders_sum = float(frame["orders"].sum())
+        buyers_sum = float(frame["buyers"].sum())
+        return {{
+            "买家数": buyers_sum,
+            "人均订单数": (orders_sum / buyers_sum) if buyers_sum else 0.0,
+            "客单价": (gmv_sum / orders_sum) if orders_sum else 0.0,
+        }}
+
+    base_factors = _driver_factors(baseline_df)
+    curr_factors = _driver_factors(current_df)
+    metrics["orders_baseline"] = base_factors["买家数"] * base_factors["人均订单数"]
+    metrics["orders_current"] = curr_factors["买家数"] * curr_factors["人均订单数"]
+    if all(v > 0 for v in base_factors.values()) and all(
+        v > 0 for v in curr_factors.values()
+    ):
+        log_deltas = {{
+            k: math.log(curr_factors[k]) - math.log(base_factors[k]) for k in base_factors
+        }}
+        abs_log = sum(abs(v) for v in log_deltas.values())
+        for k in base_factors:
+            factor_table["rows"].append(
+                {{
+                    "factor": k,
+                    "baseline": round(base_factors[k], 4),
+                    "current": round(curr_factors[k], 4),
+                    "change_rate": round(curr_factors[k] / base_factors[k] - 1.0, 4),
+                    "share": round(log_deltas[k] / abs_log, 4) if abs_log else 0.0,
+                }}
+            )
+        factor_table["rows"].sort(key=lambda r: abs(r["share"]), reverse=True)
+        factor_metrics = {{
+            "baseline": {{k: round(v, 4) for k, v in base_factors.items()}},
+            "current": {{k: round(v, 4) for k, v in curr_factors.items()}},
+        }}
+        top_factor = factor_table["rows"][0]
+        findings.append(
+            f"驱动因子分解（GMV = 买家数 × 人均订单数 × 客单价）：主要因子 "
+            f"[{{top_factor['factor']}}] 变化 {{top_factor['change_rate']:+.1%}}，"
+            f"贡献了 {{abs(top_factor['share']):.0%}} 的总偏差"
+        )
+        for r in factor_table["rows"][1:]:
+            findings.append(
+                f"因子 [{{r['factor']}}] 变化 {{r['change_rate']:+.1%}}，"
+                f"贡献 {{abs(r['share']):.0%}}"
+            )
+    else:
+        findings.append("因子存在零值，乘法对数分解不适用，仅呈现加法归因")
+else:
+    findings.append("本轮数据未覆盖订单量/买家数，驱动因子分解无法开展")
+
+save_summary(
+    title="两期对比与分省归因",
+    metrics=metrics,
+    table=table,
+    findings=findings,
+    extra={{"factor_table": factor_table, "factor_metrics": factor_metrics}},
+)
 province_rows = table["rows"]
 save_echarts_spec({{
     "title": {{"text": "分省 GMV 两期对比（归因定位）"}},
@@ -779,6 +904,158 @@ def code_exec_node(state: AgentState) -> AgentState:
 # --------------------------------------------------------------------------- #
 # 5) Critic
 # --------------------------------------------------------------------------- #
+# 反思缺口判定的"业务词 -> 可用域字段"映射：反思器提到这些概念时，只有
+# 语义目录确实覆盖（或本轮已取到）才算可执行的缺口。未列出的业务概念
+# （流量/活动/投放/库存/物流等）数仓未采集，一律不可作为重规划理由。
+_REFLECTOR_CONCEPT_FIELDS: dict[str, tuple[str, ...]] = {
+    "订单量": ("order_id",),
+    "订单": ("order_id", "order_amount"),
+    "客单价": ("order_amount", "order_id"),
+    "买家": ("user_id",),
+    "用户": ("user_id", "register_time", "gender"),
+    "地区": ("province",),
+    "省份": ("province",),
+    "城市": ("province",),
+    "品类": ("category",),
+    "商品": ("product_id", "product_name", "category", "brand", "unit_price"),
+    "品牌": ("brand",),
+    "店铺": ("shop_id", "shop_name"),
+    "退款": ("refund_amount", "refund_status", "refund_time"),
+    "折扣": ("discount_amount",),
+    "支付": ("pay_status",),
+    "性别": ("gender",),
+    "时间": ("order_time",),
+}
+
+# 概念在本轮产物中的等价列名（确定性兜底模板的别名口径）：产物列名是
+# 聚合别名（orders/buyers）而非语义字段名（order_id/user_id），缺了这层
+# 映射会把"已取到的订单量与买家数"误判成可重规划的数据缺口。
+_REFLECTOR_CONCEPT_ALIASES: dict[str, tuple[str, ...]] = {
+    "订单量": ("orders",),
+    "订单": ("orders",),
+    "客单价": ("gmv", "orders"),  # 客单价 = GMV / 订单量，两者齐备即可推导
+    "买家": ("buyers",),
+    "用户": ("buyers",),
+    "地区": ("province",),
+    "省份": ("province",),
+    "城市": ("province",),
+    "支付": ("pay_status",),
+}
+
+# 数仓未覆盖的业务概念（出现在反思理由中即为不可执行缺口，禁止据此重规划）
+_REFLECTOR_OUT_OF_SCOPE_TERMS = (
+    "流量",
+    "曝光",
+    "点击",
+    "访客",
+    "uv",
+    "pv",
+    "活动",
+    "促销",
+    "投放",
+    "广告",
+    "预算",
+    "库存",
+    "物流",
+    "履约",
+    "竞品",
+    "市场",
+    "舆情",
+    "客服",
+    "异常单",
+    "转化率",
+    "留存",
+    "复购",
+)
+
+
+def _reflector_available_scope() -> str:
+    """反思提示词的"数仓可用字段清单"小节（判定边界的客观依据）。"""
+    from semantic.catalog import COLUMNS
+
+    fields = "、".join(sorted(COLUMNS))
+    return (
+        "# 数仓可用字段清单（判定边界的唯一依据）\n"
+        f"{fields}\n"
+        "清单之外的业务维度/指标（流量、曝光、活动、投放、库存、物流、竞品等）"
+        "数仓未采集，重规划也取不到，严禁作为 insufficient 的理由。"
+    )
+
+
+def _concept_covered(concept: str, produced_fields: set[str]) -> bool:
+    """该业务概念所需字段是否已在本轮产物中（语义字段名或聚合别名任一命中）。"""
+    required = _REFLECTOR_CONCEPT_FIELDS[concept]
+    aliases = _REFLECTOR_CONCEPT_ALIASES.get(concept, ())
+    return all(f in produced_fields for f in required) or (
+        bool(aliases) and all(a in produced_fields for a in aliases)
+    )
+
+
+def _gap_is_actionable(text: str, produced_fields: set[str]) -> bool:
+    """单条反思理由是否构成"可执行的缺口"（用清单内字段可补齐）。
+
+    - 提到数仓未采集的业务概念（流量/活动/投放/库存等）=> 不可执行，
+      重规划也取不回该数据；
+    - 提到可用域内的业务概念且对应字段本轮未取到 => 可执行（值得重规划）；
+    - 未提及任何可用域概念 => 属分析深度/叙述诉求，不可执行。
+    """
+    lowered = text.lower()
+    if any(term in lowered for term in _REFLECTOR_OUT_OF_SCOPE_TERMS):
+        return False
+    for concept in _REFLECTOR_CONCEPT_FIELDS:
+        if (concept in text or concept.lower() in lowered) and not _concept_covered(
+            concept, produced_fields
+        ):
+            return True
+    return False
+
+
+def _insufficient_is_actionable(verdict: dict[str, Any], state: AgentState) -> bool:
+    """反思判定"不充分"是否可执行（确定性护栏，防重规划空转）。
+
+    校验规则（任一不满足 => 判定不可执行，直接综合）：
+    1. 至少存在一条可执行缺口（``_gap_is_actionable``：理由提到的可用域
+       字段本轮确实未取到，且不含数仓未采集的业务概念）；
+    2. 本轮产物指纹较上次重规划时有进展——指纹不变说明重规划没带来任何
+       新数据/新分析（如兜底计划每轮产出同一份结果），继续重规划纯属空转。
+
+    返回 True 表示允许重规划；False 表示应按充分处理转入综合。
+
+    回归锚点：此前反思以"缺订单量/客单价/流量/活动/异常单归因"判不充分，
+    而其中流量/活动/异常单数仓从未采集、订单量与客单价又已随取数落库，
+    重规划只能取回同一份数据 => 空转至额度耗尽降级。
+    """
+    reasons = [str(x) for x in (verdict.get("reasons") or [])]
+    missing = [str(x) for x in (verdict.get("missing") or [])]
+    candidates = [t for t in (reasons + missing) if t.strip()]
+    if not candidates:
+        return False  # 无理由的 insufficient 不可执行（防 LLM 空判）
+    fingerprint = _artifact_fingerprint(state)
+    if fingerprint and fingerprint == state.last_replan_fingerprint:
+        return False  # 重规划无进展：理由再多也是空转
+    produced_fields: set[str] = set()
+    for ref in state.datasets.values():
+        produced_fields.update(str(c) for c in (ref.get("columns") or []))
+    return any(_gap_is_actionable(text, produced_fields) for text in candidates)
+
+
+def _artifact_fingerprint(state: AgentState) -> str:
+    """本轮产物进展指纹：数据集（名/行列数）+ summary 内容 + 图表数量。"""
+    import hashlib
+
+    parts: list[str] = []
+    for name, ref in sorted(state.datasets.items()):
+        parts.append(f"{name}:{ref.get('rows')}x{len(ref.get('columns') or [])}")
+    for artifact in state.artifacts:
+        if artifact.kind == "summary":
+            parts.append(
+                json.dumps(artifact.payload.get("summary", {}), ensure_ascii=False, sort_keys=True)
+            )
+        else:
+            parts.append(f"{artifact.kind}:{artifact.name}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
 def critic_node(state: AgentState) -> AgentState:
     """反思节点：完整性 / 正确性 / 一致性三检（需求 §2.A Critic/ReflectionNode）。
 
@@ -819,26 +1096,44 @@ def critic_node(state: AgentState) -> AgentState:
             trace_digest += "\n自愈错误记录：" + "；".join(state.error_context.errors[-3:])
         verdict = _llm_json(
             llm,
-            '仅输出 JSON：{"verdict": "sufficient"|"insufficient", "reasons": [...]}',
-            f"用户问题：{state.user_query}\n执行轨迹：\n{trace_digest}",
+            REFLECTOR_SYSTEM,
+            f"用户问题：{state.user_query}\n"
+            f"{_reflector_available_scope()}\n"
+            f"执行轨迹：\n{trace_digest}",
         )
         if verdict and verdict.get("verdict") == "insufficient":
+            reasons = verdict.get("reasons")
+            # 确定性护栏（回归锚点）：反思不得把"数仓未覆盖的维度"当数据缺口。
+            # 此前反思以"缺订单量/流量/活动归因"判不充分，而可用域内数据与
+            # 分析其实已齐备，重规划只能取回同一份数据 => 空转至额度耗尽降级。
+            if not _insufficient_is_actionable(verdict, state):
+                logger.info(
+                    "LLM 反思判定不充分但缺口不在可用域内或计划无进展，按充分处理",
+                    extra={"error": str(reasons)[:500]},
+                )
+                state.scratchpad.append(f"[critic-guard] 反思缺口不可执行，直接综合：{reasons}")
+                events.emit_reflection(
+                    str(reasons),
+                    "proceed",
+                    "反思缺口不在可用数据域内（重规划取不到），直接转入综合报告",
+                )
+                return state.apply(phase="synthesize")
             # LLM 反思重规划与工具自愈共用重试预算（防"不耗额度的无限重规划"，
             # 只能靠迭代护栏兜底而空烧 LLM 调用）
-            keep = state.error_context.record(f"LLM 反思判定产物不充分: {verdict.get('reasons')}")
-            state.scratchpad.append(f"[critic-llm] {verdict.get('reasons')}")
+            keep = state.error_context.record(f"LLM 反思判定产物不充分: {reasons}")
+            state.scratchpad.append(f"[critic-llm] {reasons}")
             logger.warning(
                 "LLM 反思判定产物不充分，触发重规划",
-                extra={"error": str(verdict.get("reasons", ""))[:500]},
+                extra={"error": str(reasons)[:500]},
             )
-            events.emit_reflection(
-                str(verdict.get("reasons", "")), "replan", "LLM 反思判定产物不充分，触发重规划"
-            )
+            events.emit_reflection(str(reasons), "replan", "LLM 反思判定产物不充分，触发重规划")
             if not keep:
                 logger.error("重规划额度耗尽，转入综合节点如实报告")
                 events.emit_reflection("重规划额度耗尽", "proceed", "转入综合节点如实报告")
                 return state.apply(phase="synthesize")
-            return state.apply(phase="plan")
+            # 记录本次重规划时的产物指纹：下轮反思若判定不充分但指纹未变，
+            # 说明重规划没带来任何新数据/新分析，直接按充分处理（防空转）
+            return state.apply(phase="plan", last_replan_fingerprint=_artifact_fingerprint(state))
     events.emit_reflection("完整性/正确性/一致性三检通过", "proceed", "转入综合报告")
     return state.apply(phase="synthesize")
 
@@ -904,6 +1199,8 @@ def _summary_analyst_markdown(summary: dict[str, Any]) -> list[str]:
     """沙箱 summary -> 分析师叙述（数值万元/百分比化，禁 raw dict 直出）。
 
     table 行（分省归因矩阵）渲染为归因表格；metrics 键值译为人读短语。
+    extra.factor_table（驱动因子分解）另起小节渲染——因子是比值/人数，
+    不做万元换算。
     """
     lines: list[str] = []
     title = summary.get("title", "")
@@ -914,29 +1211,65 @@ def _summary_analyst_markdown(summary: dict[str, Any]) -> list[str]:
         lines.append(f"- {f}")
     if metrics:
         rendered = "；".join(
-            f"{k} = {_fmt_wan(v)}" if isinstance(v, (int, float)) else f"{k} = {v}"
+            f"{k} = {_metric_human(v, k)}" if isinstance(v, (int, float)) else f"{k} = {v}"
             for k, v in metrics.items()
         )
         lines.append(f"- 关键指标：{rendered}")
-    table = summary.get("table") or {}
-    rows = table.get("rows") or []
-    cols = table.get("columns") or []
-    if rows and cols:
+    lines.extend(_render_table(summary.get("table") or {}, limit=10))
+    factor_table = (summary.get("extra") or {}).get("factor_table") or {}
+    factor_rows = factor_table.get("rows") or []
+    if factor_rows:
         lines.append("")
-        lines.append("| " + " | ".join(str(c) for c in cols) + " |")
-        lines.append("|" + "|".join([" --- "] * len(cols)) + "|")
-        for row in rows[:10]:
-            cells = []
-            for c, v in zip(cols, row, strict=False):  # 行长不齐时容忍截断
-                if c in ("baseline", "current", "delta", "value", "gmv"):
-                    cells.append(_fmt_wan(v))
-                elif c in ("share", "change_rate"):
-                    cells.append(_fmt_pct(v))
-                else:
-                    cells.append(str(v))
-            lines.append("| " + " | ".join(cells) + " |")
-        if len(rows) > 10:
-            lines.append(f"（仅列示贡献前 10，共 {len(rows)} 行）")
+        lines.append("**驱动因子分解（GMV = 买家数 × 人均订单数 × 客单价）**")
+        lines.extend(_render_table(factor_table, limit=10, currency=False))
+    return lines
+
+
+# 非金额指标键名（订单量/人数等计数类）——严禁按万元换算
+_COUNT_METRIC_KEYS = ("orders", "buyers", "count", "users", "quantity", "qty")
+
+
+def _metric_human(value: Any, key: str = "") -> str:
+    """指标值人读化：计数类指标保留原值（可带小数），金额类转万元。"""
+    if any(token in key.lower() for token in _COUNT_METRIC_KEYS):
+        try:
+            return f"{float(value):.2f}".rstrip("0").rstrip(".")
+        except (TypeError, ValueError):
+            return str(value)
+    return _fmt_wan(value)
+
+
+def _render_table(table: dict[str, Any], *, limit: int = 10, currency: bool = True) -> list[str]:
+    """把 summary table 渲染为 Markdown 表格（兼容 list 行与 dict 行两种形态）。
+
+    - list 行：按 columns 顺序逐列渲染（分省归因矩阵）；
+    - dict 行：按 columns 取键渲染（驱动因子分解）；
+    - ``currency=True``（金额矩阵）：baseline/current/delta/value/gmv 按万元；
+      ``currency=False``（因子矩阵，值为人数/比值）：数值原样渲染，
+      否则"买家数 11 人"会被误写成"0.00 万元"；
+    - share/change_rate 一律百分比，其余（factor/province 等）原样。
+    """
+    rows = table.get("rows") or []
+    cols = [str(c) for c in (table.get("columns") or [])]
+    if not rows or not cols:
+        return []
+    lines = ["", "| " + " | ".join(cols) + " |", "|" + "|".join([" --- "] * len(cols)) + "|"]
+    for row in rows[:limit]:
+        if isinstance(row, dict):
+            values = [row.get(c) for c in cols]
+        else:
+            values = list(row)
+        cells: list[str] = []
+        for c, v in zip(cols, values, strict=False):  # 行长不齐时容忍截断
+            if c in ("share", "change_rate"):
+                cells.append(_fmt_pct(v))
+            elif currency and c in ("baseline", "current", "delta", "value", "gmv"):
+                cells.append(_fmt_wan(v))
+            else:
+                cells.append(str(v))
+        lines.append("| " + " | ".join(cells) + " |")
+    if len(rows) > limit:
+        lines.append(f"（仅列示前 {limit} 行，共 {len(rows)} 行）")
     return lines
 
 

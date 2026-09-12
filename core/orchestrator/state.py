@@ -117,6 +117,13 @@ class AgentState(BaseModel):
     error_context: ErrorContext = Field(default_factory=ErrorContext)
     # 数据集名 -> ParquetRef（编排器内传递，不进 LLM prompt）
     datasets: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # 计划步骤 id -> 该步骤产出的数据集名列表（重规划时按同 id 覆盖）。
+    # analyze 步骤据此解析本轮依赖的真实输入——严禁按 datasets 字典首尾
+    # 取数：跨轮次累积时首尾会指向上（几）轮遗留数据集，产出假结论。
+    step_outputs: dict[str, list[str]] = Field(default_factory=dict)
+    # 上次因 LLM 反思触发重规划时的产物进展指纹（重规划无进展护栏）：
+    # 指纹不变说明重规划未带来任何新数据/新分析，必须停止空转。
+    last_replan_fingerprint: str = ""
     iteration: int = Field(default=0, ge=0, description="图迭代步数（防死循环护栏）")
 
     def apply(self, **updates: Any) -> AgentState:
