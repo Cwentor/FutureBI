@@ -64,12 +64,13 @@
   - **HTTP 入口**：`POST /api/agent/run`（同步编排，鉴权 + HITL 澄清中断/恢复，resume_token 属主绑定）与
     `GET /api/v1/agent/chat/stream`（SSE 流式：plan_created / step_start / tool_start / tool_end /
     reflection / hitl_request / artifact_emit / done / error 九类事件实时推送，异常收敛为 error 事件不崩流）
-  - **三栏交互式工作台**：中央主对话页只承载对话（用户气泡、HITL 澄清交互卡、完成/错误摘要，
-    底部输入条内置模型选择器随时切换供应商模型）；左侧边栏承载视图切换（执行报告 / ECharts 交互图表 /
-    沙箱代码与输出 / 数据审计表 + Markdown/HTML 导出经侧边栏切换查看）、会话历史、
-    知识目录（`/api/schema/summary` 语义目录字段清单）与设置/用户中心；右侧执行流程面板
-    （任务 DAG 时间线、DSL/沙箱工具手风琴、反思自愈节点，>50 步自动切换窗口化虚拟渲染——
-    事件数据全量保留、DOM 仅渲染可视窗口，可一键收起），零前端框架（原生 JS + vendored ECharts/PrismJS）
+  - **Agent 对话流工作台**：中央主对话页以 Agent 对话流承载全过程——用户气泡、
+    任务计划（DAG 步骤清单 + 进度）、工具调用（DSL/沙箱时间线活动行，点击展开契约/代码/输出）、
+    反思自愈节点、HITL 澄清交互卡、完成/错误摘要，>50 步自动切换窗口化虚拟渲染
+    （事件数据全量保留、DOM 仅渲染可视窗口），底部输入条内置模型选择器随时切换供应商模型；
+    左侧边栏承载视图切换（执行报告 / ECharts 交互图表 / 沙箱代码与输出 / 数据审计表 +
+    Markdown/HTML 导出经侧边栏切换查看）、会话历史、知识目录（`/api/schema/summary`
+    语义目录字段清单）与设置/用户中心，零前端框架（原生 JS + vendored ECharts/PrismJS）
 - **多模型供应商网关（providers/）**：智谱 / OpenAI / Anthropic / Gemini 预置供应商，
   OpenAI Chat、OpenAI Responses、Anthropic、Gemini 四协议适配与 JSON Mode 抹平；API Key
   落盘加密存储、列表响应零密钥回传，工作台设置页可视化 CRUD + 连通性探测，SSE 编排支持

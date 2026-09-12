@@ -6,7 +6,7 @@ DataAgent 在"受控 DSL → 确定性 SQL"核心链路之上，叠加图式编�
 
 ```mermaid
 flowchart LR
-    U[用户自然语言] --> WEB[三栏工作台 / SSE 流式]
+    U[用户自然语言] --> WEB[Agent 对话流工作台 / SSE 流式]
     WEB --> ORCH{编排器<br>StateGraph 六节点}
     ORCH -->|规划 + 枚举 profiling| AG[意图路由 +<br>LLM / 启发式 Agent]
     ORCH -->|取数| QRY[受控查询链路<br>执行前审计 + 结果断言]
@@ -47,7 +47,7 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph L1[交互层 web/]
-        WEBUI[三栏工作台<br>中央对话 + 侧边栏产物视图 + 右侧执行流程]
+        WEBUI[Agent 对话流工作台<br>对话流活动时间线 + 侧边栏产物视图]
         SSE[SSE 流式端点<br>九类事件实时推送]
         API[查询 / 编排 / 指标 API]
     end
@@ -186,7 +186,7 @@ flowchart LR
 | 静态审计 | sqlglot AST（只读结构 / 笛卡尔积 / 无界输出） |
 | 沙箱后端 | Docker 强隔离 / 子进程兜底（可插拔） |
 | 模型接入 | 多供应商网关：OpenAI Chat / Responses、Anthropic、Gemini 协议适配 |
-| Web | Python 标准库 `http.server` + 原生 JS 三栏工作台（vendored ECharts / PrismJS，零前端框架） |
+| Web | Python 标准库 `http.server` + 原生 JS Agent 对话流工作台（vendored ECharts / PrismJS，零前端框架） |
 | 质量 | pytest、black、ruff、Golden Dataset |
 
 ## 全链路能力
@@ -206,7 +206,7 @@ flowchart LR
 | 执行 | 只读白名单、执行前审计门、超时取消、扫描/结果熔断、SQL 自愈、连接池 | `exec/` |
 | 展示 | 商业分析师四段式报告、数据质检小节、中文业务解释、number/line/bar/pie/pivot/table 推荐 | `present/` `core/orchestrator/nodes.py` |
 | 治理 | 认证、作用域、表/列/RLS、审计、结构化 JSON 日志（request_id 贯穿）、指标 | `auth/` `security/` `audit/` |
-| 交付 | 三栏工作台、健康检查、查询 API、编排端点、指标 API | `web/` |
+| 交付 | Agent 对话流工作台、健康检查、查询 API、编排端点、指标 API | `web/` |
 
 ## 可观测性
 

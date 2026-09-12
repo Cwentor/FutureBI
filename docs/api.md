@@ -25,7 +25,7 @@ python -m web.server 8000
 | `/api/settings/providers/test` | POST | 连通性探测（极小 ping 请求，返回 HTTP 200 + 延时） |
 | `/api/settings/providers/<id>/reveal` | POST | 查看已保存的真实 API Key（显式动作，记审计日志） |
 | `/api/schema/summary` | GET | 语义目录摘要：按物理表分组的可查询字段清单（知识上下文） |
-| `/static/` | GET | 三栏工作台前端（侧边栏 / 对话 / 执行流程） |
+| `/static/` | GET | Agent 对话流工作台前端（侧边栏 + 单列对话） |
 
 ## 查询示例
 
