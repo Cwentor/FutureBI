@@ -575,10 +575,6 @@
     $("model-switch").addEventListener("change", function () {
       setCurrentSelection($("model-switch").value);
       updateModelIndicator();
-      var sel = selectedProviderModel();
-      if (sel.provider_id) {
-        toast("本次查询将使用：" + sel.provider_id + " / " + sel.model_id, "info");
-      }
     });
   }
 
