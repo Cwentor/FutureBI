@@ -26,10 +26,12 @@ def test_synthesizer_prompt_contract():
     assert "资深商业数据分析师" in SYNTHESIZER_SYSTEM
     assert "严禁向用户输出 raw dict/json" in SYNTHESIZER_SYSTEM
     assert "### 核心结论" in SYNTHESIZER_SYSTEM
-    assert "### 区域归因定位" in SYNTHESIZER_SYSTEM
+    assert "### 归因维度定位" in SYNTHESIZER_SYSTEM
     assert "### 驱动因素分析（买家数/客单价/转化率）" in SYNTHESIZER_SYSTEM
     assert "### 业务假设与排查建议" in SYNTHESIZER_SYSTEM
     assert "万元" in SYNTHESIZER_SYSTEM and "主要矛盾" in SYNTHESIZER_SYSTEM
+    # 归因维度口径纪律：只呈现材料实际下钻的维度并说明入选依据
+    assert "归因维度口径" in SYNTHESIZER_SYSTEM
 
 
 def test_degraded_summarizer_prompt_contract():
@@ -185,19 +187,30 @@ def test_inherit_overview_scope_keeps_declared_window():
     assert aligned["time_filter"]["absolute"]["start"] == "2024-05-08"
 
 
-def test_diagnostic_dsl_pair_carries_province_dimension():
-    """诊断兜底两期对必须带省份维度且两期窗口/过滤完全同口径。"""
+def test_diagnostic_dsl_pair_carries_dimension_pool():
+    """诊断兜底两期对未点名维度时取候选维度池（而非只取省份），两期同口径。"""
     from core.orchestrator.nodes import _diagnostic_dsl_pair
 
     base, curr = _diagnostic_dsl_pair("分析 5 月第一周比第二周 GMV 下滑原因")
     for dsl in (base, curr):
-        assert dsl["dimensions"] == [{"field": "province"}]
+        dims = [d["field"] for d in dsl["dimensions"]]
+        # 候选池覆盖省份/品牌/品类：由分析层按信息增益裁决主因维度
+        assert dims == ["province", "brand", "category"]
         assert {"field": "pay_status", "operator": "eq", "value": "SUCCESS"} in dsl["filters"]
     assert base["time_filter"]["absolute"]["end"] == curr["time_filter"]["absolute"]["start"]
 
 
-def test_diagnostic_e2e_report_contains_region_attribution(tmp_path, monkeypatch):
-    """端到端：诊断问题报告必须含分省归因定位与驱动因素叙述（不再只有对比图）。"""
+def test_diagnostic_dsl_pair_honors_explicit_dimension():
+    """用户显式点名维度时只取该维度（"按品类"不得再带省份）。"""
+    from core.orchestrator.nodes import _diagnostic_dsl_pair
+
+    base, curr = _diagnostic_dsl_pair("分析 5 月第一周比第二周 GMV 下滑原因，按品类定位")
+    for dsl in (base, curr):
+        assert [d["field"] for d in dsl["dimensions"]] == ["category"]
+
+
+def test_diagnostic_e2e_report_contains_dimension_attribution(tmp_path, monkeypatch):
+    """端到端：诊断问题报告必须含维度归因定位与驱动因素叙述（不再只有对比图）。"""
     from config import settings
     from core.orchestrator.agent import run_agent
 
@@ -206,9 +219,8 @@ def test_diagnostic_e2e_report_contains_region_attribution(tmp_path, monkeypatch
         "分析一下 2024 年 5 月第一周比第二周 GMV 下滑的原因，按地区定位", session_id="r2e2e"
     )
     assert trace.phase == "done"
-    assert "分省" in trace.report  # 归因表标题/表格
-    assert "主要矛盾" in trace.report  # 主要矛盾省份叙述
-    # ECharts 必须是分省对比（不再是 baseline/current 两根柱）
+    assert "主要矛盾" in trace.report  # 主因维度取值叙述
+    # ECharts 必须是维度下钻对比（不再是 baseline/current 两根柱）
     charts = [a for a in trace.artifacts if a["kind"] == "echarts"]
     assert charts and charts[0]["payload"]["xAxis"]["data"] != ["baseline", "current"]
 
@@ -279,10 +291,187 @@ def test_pure_query_path_unaffected_by_diagnostic_dimensions(tmp_path, monkeypat
 
 
 # --------------------------------------------------------------------------- #
+# M2：维度下钻约束（"没问分省却走了分省"回归锚点）
+# --------------------------------------------------------------------------- #
+def test_explicit_dimensions_normalizes_dimension_terms():
+    """维度词归一：地区/省份/大区 -> province，品类/类目 -> category。"""
+    from core.orchestrator.nodes import _explicit_dimensions
+
+    assert _explicit_dimensions("按地区定位下滑主因") == ["province"]
+    assert _explicit_dimensions("看看品类结构") == ["category"]
+    assert _explicit_dimensions("按品牌拆一下") == ["brand"]
+    # 泛化表述不锚定具体维度 => 交由信息增益自动择优
+    assert _explicit_dimensions("分析下滑原因") == []
+
+
+def test_diagnostic_dimension_pool_explicit_beats_pool():
+    """显式维度优先于候选池：点名品类时不得再夹带省份。"""
+    from core.orchestrator.nodes import _diagnostic_dimension_pool
+
+    assert _diagnostic_dimension_pool("按品类看下滑原因") == ["category"]
+    assert _diagnostic_dimension_pool("为什么下滑") == ["province", "brand", "category"]
+
+
+def test_heuristic_plan_layers_factor_before_dimension():
+    """诊断兜底 DAG 强制分层：先因子分解，再维度下钻，两者并行喂给综合。"""
+    from core.orchestrator.nodes import _heuristic_plan
+
+    steps = _heuristic_plan("分析一下 5 月 GMV 为什么下滑")
+    kinds = [(s.id, s.kind) for s in steps]
+    assert kinds == [("s1", "query"), ("s2", "analyze"), ("s3", "analyze"), ("s4", "synthesize")]
+    factor_step, dim_step = steps[1], steps[2]
+    assert "因子" in factor_step.goal  # 第一步先拆量/价
+    assert "信息增益" in dim_step.goal and "候选维度池" in dim_step.goal
+    assert factor_step.depends_on == ["s1"] and dim_step.depends_on == ["s1"]
+    assert steps[3].depends_on == ["s2", "s3"]  # 综合消费因子与维度双产物
+
+
+def test_heuristic_plan_honors_explicit_dimension_in_goal():
+    """显式点名维度时下钻步骤目标写明该维度（不再声称全维度扫描）。"""
+    from core.orchestrator.nodes import _heuristic_plan
+
+    steps = _heuristic_plan("按品类分析 GMV 为什么下滑")
+    assert "category" in steps[2].goal
+    assert "候选维度池" not in steps[2].goal
+
+
+def test_drilldown_template_emits_selection_rationale_and_no_default_province():
+    """下钻模板必须给出入选维度依据，且不把省份写死为主图维度。"""
+    from core.orchestrator.nodes import _drilldown_template
+
+    code = _drilldown_template(["s1_v0", "s1_v1"])
+    assert "信息增益" in code and "优先下钻该维度定位主因" in code
+    assert "候选维度自动发现" in code  # 维度由数据列动态发现
+    assert 'primary["dimension"]' in code  # 主图维度取信息增益胜出者
+    assert 'table["rows"]' in code and "save_echarts_spec" in code
+
+
+def test_e2e_unprompted_dimension_is_not_province_only(tmp_path, monkeypatch):
+    """端到端：未点名维度的诊断问题不得只按分省下钻。"""
+    from config import settings
+    from core.orchestrator.agent import run_agent
+
+    monkeypatch.setattr(settings, "WORKSPACE_ROOT", tmp_path)
+    trace = run_agent("分析一下 2024 年 5 月第一周比第二周 GMV 下滑的原因", session_id="m2pool")
+    assert trace.phase == "done"
+    summaries = [a["payload"]["summary"] for a in trace.artifacts if a["kind"] == "summary"]
+    drill = next(s for s in summaries if s["title"] == "维度信息增益归因")
+    # 入选依据话术必须存在（解释"为什么下钻这个维度"）
+    assert any("候选维度信息增益扫描" in f for f in drill["findings"])
+    # 候选维度全景必须覆盖多个维度（而非只扫省份）
+    gains = (drill["extra"] or {}).get("gain_table") or {}
+    dims = [row[0] for row in gains.get("rows", [])]
+    assert len(dims) >= 2 and "province" in dims
+    # 未点名维度时不得出现"分省"字样（分省不是默认口径）
+    assert "分省" not in trace.report
+
+
+def test_e2e_explicit_category_dimension_only_drills_category(tmp_path, monkeypatch):
+    """端到端：点名品类时主图与归因矩阵只呈现品类。"""
+    from config import settings
+    from core.orchestrator.agent import run_agent
+
+    monkeypatch.setattr(settings, "WORKSPACE_ROOT", tmp_path)
+    trace = run_agent(
+        "分析一下 2024 年 5 月第一周比第二周 GMV 下滑的原因，按品类定位",
+        session_id="m2cat",
+    )
+    assert trace.phase == "done"
+    summaries = [a["payload"]["summary"] for a in trace.artifacts if a["kind"] == "summary"]
+    drill = next(s for s in summaries if s["title"] == "维度信息增益归因")
+    assert (drill["extra"] or {}).get("primary_dimension") == "category"
+    assert drill["table"]["columns"][0] == "category"
+    charts = [a for a in trace.artifacts if a["kind"] == "echarts"]
+    assert charts and "品类" in charts[0]["payload"]["title"]["text"]
+
+
+def test_planner_prompt_states_dimension_discipline():
+    """Planner 提示词必须写明维度下钻纪律与"先因子后维度"分层。"""
+    from core.orchestrator.prompts import PLANNER_FEWSHOT, PLANNER_SYSTEM
+
+    assert "维度下钻纪律" in PLANNER_SYSTEM
+    assert "先因子后维度" in PLANNER_SYSTEM
+    assert "候选维度池" in PLANNER_SYSTEM
+    assert "没问分省却只出分省" in PLANNER_SYSTEM
+    assert "候选维度池" in PLANNER_FEWSHOT
+
+
+# --------------------------------------------------------------------------- #
+# 时间粒度口径对齐（LLM 漂移修复：契约默认 day 不得覆盖问句语义粒度）
+# --------------------------------------------------------------------------- #
+def test_align_time_granularity_fixes_llm_default_day():
+    """同一时间窗口下，LLM 的 day 粒度被问句语义粒度纠正（回归锚点）。
+
+    此前 DSL 契约 granularity 默认 day，LLM 漏写该字段时"上个月"会被切成
+    日粒度，同一问句多次独立调用出现 month/day 漂移（多轮评测偶发失败）。
+    """
+    from agent.semantic_check import align_time_granularity
+    from semantic.dsl_schema import QueryDSL
+
+    dsl = QueryDSL.model_validate(
+        {
+            "metrics": [
+                {"kind": "aggregate", "field": "order_amount", "agg": "sum", "alias": "gmv"}
+            ],
+            "time_filter": {
+                "granularity": "day",
+                "range_type": "relative",
+                "relative": {"amount": 1, "unit": "month", "mode": "calendar"},
+            },
+        }
+    )
+    out = align_time_granularity(dsl, "上个月的GMV是多少？")
+    assert out.time_filter.granularity.value == "month"
+
+
+def test_align_time_granularity_keeps_genuine_daily_intent():
+    """问句本就要求日粒度时不误改（"每日"语义必须保留 day）。"""
+    from agent.semantic_check import align_time_granularity
+    from semantic.dsl_schema import QueryDSL
+
+    dsl = QueryDSL.model_validate(
+        {
+            "metrics": [
+                {"kind": "aggregate", "field": "order_amount", "agg": "sum", "alias": "gmv"}
+            ],
+            "time_filter": {
+                "granularity": "day",
+                "range_type": "relative",
+                "relative": {"amount": 30, "unit": "day", "mode": "trailing"},
+            },
+        }
+    )
+    out = align_time_granularity(dsl, "近30天每日GMV是多少？")
+    assert out.time_filter.granularity.value == "day"
+
+
+def test_align_time_granularity_ignores_different_windows():
+    """时间窗口本身不一致时不改粒度（真实语义差异交由校验与自愈处理）。"""
+    from agent.semantic_check import align_time_granularity
+    from semantic.dsl_schema import QueryDSL
+
+    dsl = QueryDSL.model_validate(
+        {
+            "metrics": [
+                {"kind": "aggregate", "field": "order_amount", "agg": "sum", "alias": "gmv"}
+            ],
+            "time_filter": {
+                "granularity": "day",
+                "range_type": "relative",
+                "relative": {"amount": 3, "unit": "month", "mode": "trailing"},
+            },
+        }
+    )
+    out = align_time_granularity(dsl, "上个月的GMV是多少？")
+    # 窗口（3 个月 vs 1 个月）不同 => 粒度保持 LLM 原样，不做臆测改写
+    assert out.time_filter.granularity.value == "day"
+
+
+# --------------------------------------------------------------------------- #
 # 辅助：归因模板在沙箱外的等价性验证（pandas 逻辑单测）
 # --------------------------------------------------------------------------- #
 def test_region_attribution_math_matches_template_logic():
-    """分省加法归因的数学与模板一致：Δ = 当前期 - 基线期，share 按 |Δ| 归一。"""
+    """维度加法归因的数学与模板一致：Δ = 当前期 - 基线期，share 按 |Δ| 归一。"""
     from core.skills.decomposition import additive_decomposition
 
     df = pd.DataFrame(

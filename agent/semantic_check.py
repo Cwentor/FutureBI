@@ -62,6 +62,49 @@ def normalize_time_anchor(dsl: QueryDSL) -> QueryDSL:
     return dsl
 
 
+def align_time_granularity(dsl: QueryDSL, query: str) -> QueryDSL:
+    """时间粒度确定性对齐（口径漂移修复）。
+
+    时间粒度必须由问句语义决定，而非由契约默认值兜底。DSL 契约的
+    ``granularity`` 默认值恰是 ``day``，LLM 漏写该字段时聚合区间（如"上个月"）
+    会被切成日粒度，与启发式口径不一致导致多轮评测偶发漂移（同一问句 5 次
+    独立调用中出现 1 次 day）。
+
+    规则：仅当启发式能从问句确定性解析出粒度、且与 LLM 产出的粒度不同、且
+    两者的时间段与单位一致（同一时间窗口的粒度表达分歧）时，采用启发式粒度；
+    时间窗口本身不一致时不动（属真实语义差异，交由语义校验与自愈处理）。
+    """
+    tf = dsl.time_filter
+    if tf is None:
+        return dsl
+    try:
+        expected = _H.run(query, principal=None)
+    except PipelineError:
+        return dsl
+    etf = expected.time_filter
+    if etf is None or etf.granularity == tf.granularity:
+        return dsl
+    # 只在"同一时间窗口"上对齐粒度：区间类型/单位/总量/锚点需一致
+    if etf.range_type != tf.range_type:
+        return dsl
+    if etf.range_type == TimeRangeType.RELATIVE:
+        e_rel, a_rel = etf.relative, tf.relative
+        if e_rel is None or a_rel is None:
+            return dsl
+        same_window = (e_rel.unit, e_rel.amount, e_rel.mode) == (
+            a_rel.unit,
+            a_rel.amount,
+            a_rel.mode,
+        )
+    else:
+        same_window = etf.absolute == tf.absolute
+    if not same_window:
+        return dsl
+    return dsl.model_copy(
+        update={"time_filter": tf.model_copy(update={"granularity": etf.granularity})}
+    )
+
+
 def validate_semantics(query: str, dsl: QueryDSL, principal: str | None = None) -> list[str]:
     """校验可由确定性规则确认的关键语义槽位。
 

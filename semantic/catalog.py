@@ -134,6 +134,12 @@ DIMENSION_MEMBERS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# 可下钻字符串维度白名单（诊断归因候选维度池）：只有这些字段才允许作为
+# 「用户未显式指定维度」时的自动下钻候选——分省只是候选之一，由信息增益
+# 裁决入选者，严禁把 province 当默认第一梯队写死。高基数字段
+# （product_name/shop_name）与身份属性字段（gender）不在列。
+DRILLDOWN_DIM_FIELDS: tuple[str, ...] = ("province", "brand", "category")
+
 # 大区 -> 省份成员映射（审计修复 M1 区域词展开）。
 # 行政区划归属是业务知识（保留常量），但展开值域必须与数仓实际存在的省份取交集：
 # mock 数仓 dim_user.province 仅含 广东/浙江/江苏/北京/上海/四川/湖北/山东，

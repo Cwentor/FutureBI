@@ -20,7 +20,12 @@ from pydantic import ValidationError
 
 from agent.errors import PipelineError
 from agent.prompts import build_fix_messages, build_messages, build_rewrite_messages
-from agent.semantic_check import expand_region_filters, normalize_time_anchor, validate_semantics
+from agent.semantic_check import (
+    align_time_granularity,
+    expand_region_filters,
+    normalize_time_anchor,
+    validate_semantics,
+)
 from providers import chat_text
 from semantic.dsl_schema import QueryDSL
 
@@ -80,9 +85,11 @@ class LLMNL2DSL:
                 if "error" in obj and obj.get("error"):
                     raise PipelineError("LLM 拒绝解析: " + str(obj["error"]))
                 candidate = QueryDSL.model_validate(obj)
-                # 确定性规范化（审计修复 M1/M2）：区域词展开 + 相对时间锚点补齐，
-                # 消除 LLM 生成 DSL 与 golden 契约的结构性漂移
-                candidate = normalize_time_anchor(expand_region_filters(candidate))
+                # 确定性规范化（审计修复 M1/M2）：区域词展开 + 相对时间锚点补齐 +
+                # 时间粒度对齐（契约默认 day 会切坏"上个月"等区间口径）
+                candidate = align_time_granularity(
+                    normalize_time_anchor(expand_region_filters(candidate)), query
+                )
                 semantic_errors = validate_semantics(query, candidate, principal)
                 if semantic_errors:
                     raise PipelineError("语义校验失败：" + "；".join(semantic_errors))
@@ -116,8 +123,11 @@ class LLMNL2DSL:
                 obj = extract_json(raw)
                 if "error" in obj and obj.get("error"):
                     raise PipelineError("LLM 拒绝解析: " + str(obj["error"]))
-                # 自愈重写同样做规范化（与首跑口径一致：区域词展开 + 时间锚补齐）
-                return normalize_time_anchor(expand_region_filters(QueryDSL.model_validate(obj)))
+                # 自愈重写同样做规范化（与首跑口径一致：区域词展开 + 时间锚补齐 + 粒度对齐）
+                return align_time_granularity(
+                    normalize_time_anchor(expand_region_filters(QueryDSL.model_validate(obj))),
+                    query,
+                )
             except (ValueError, TypeError, KeyError, ValidationError, PipelineError) as exc:
                 last_error = exc
                 messages = build_fix_messages(query, raw, str(exc)[:400], principal)

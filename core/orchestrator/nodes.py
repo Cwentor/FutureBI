@@ -46,9 +46,83 @@ from core.sandbox.api import run_code
 from core.sandbox.ast_guard import static_check
 from core.skills.decomposition import multiplicative_decomposition
 from core.skills.drilldown import drilldown_by_information_gain
+from semantic.catalog import DRILLDOWN_DIM_FIELDS as DRILLDOWN_DIM_FIELDS
 from semantic.catalog import REGION_PROVINCE_MAPPING as REGION_PROVINCE_MAPPING
 
 logger = get_logger("core.orchestrator")
+
+
+# --------------------------------------------------------------------------- #
+# 维度下钻候选（审计修复 M2：杜绝"没问分省却默认走分省"）
+# --------------------------------------------------------------------------- #
+# 维度词 -> 语义字段（用户显式指定维度时据此确定下钻口径）。
+_DIMENSION_TERMS: dict[str, str] = {
+    "province": "province",
+    "省份": "province",
+    "省": "province",
+    "地区": "province",
+    "地域": "province",
+    "区域": "province",
+    "大区": "province",
+    "城市": "province",
+    "category": "category",
+    "品类": "category",
+    "类目": "category",
+    "品类结构": "category",
+    "brand": "brand",
+    "品牌": "brand",
+    "店铺": "shop_name",
+    "门店": "shop_name",
+    "shop_name": "shop_name",
+}
+
+# 用户未显式指定维度时的候选维度池（有意收窄，与 DRILLDOWN_DIM_FIELDS 同源）：
+# 联合明细同时覆盖 province 与 category，分析层按 info-gain 择优下钻，
+# 而非默认向用户呈现分省。高基数字段（shop_name/brand 明细膨胀）不入池，
+# 用户显式点名时才取。
+_DIAGNOSTIC_DIM_POOL: tuple[str, ...] = DRILLDOWN_DIM_FIELDS
+
+
+# 维度字段 -> 中文标签（图表标题与归因叙述的人读化；字段名仅保留在矩阵列头）
+_DIMENSION_LABELS: dict[str, str] = {
+    "province": "省份",
+    "category": "品类",
+    "brand": "品牌",
+    "shop_name": "店铺",
+}
+
+
+def _dimension_label(field: str) -> str:
+    """维度字段名 -> 中文标签（未知字段原样返回）。"""
+    return _DIMENSION_LABELS.get(field, field)
+
+
+def _explicit_dimensions(query: str) -> list[str]:
+    """用户问题中显式点名的维度字段（按出现顺序去重）。
+
+    - 泛化的"按维度拆分"（"按维度/分维度"）不锚定具体字段 => 返回空，
+      交由分析层在候选池内按信息增益自动下钻；
+    - "地区/省份/大区/城市"等词统一归一为 province；"品类/类目"-> category；
+      "品牌"-> brand；"店铺/门店"-> shop_name。
+    """
+    found: list[str] = []
+    lowered = query.lower()
+    for term, field in _DIMENSION_TERMS.items():
+        if term in lowered and field not in found:
+            found.append(field)
+    return found
+
+
+def _diagnostic_dimension_pool(query: str) -> list[str]:
+    """诊断问题的下钻维度池：显式点名的维度优先，否则用联合候选池。
+
+    回归锚点（M2）：此前确定性兜底两期对硬编码 ``dimensions=[province]``，
+    用户问"为什么下滑"却未提省份时仍走分省，且分析模板只产出分省图表；
+    现改为——显式维度则按显式（如"按品类"只取品类），未显式则取联合候选池
+    由信息增益定位主因维度（信息增益胜出者才渲染主图）。
+    """
+    explicit = _explicit_dimensions(query)
+    return explicit if explicit else list(_DIAGNOSTIC_DIM_POOL)
 
 
 # --------------------------------------------------------------------------- #
@@ -132,9 +206,16 @@ def clarify_node(state: AgentState) -> AgentState:
 # 2) Planner
 # --------------------------------------------------------------------------- #
 def _heuristic_plan(query: str) -> list[PlanStep]:
-    """确定性兜底规划：诊断式三步（总量对比 -> 归因分析 -> 综合）。
+    """确定性兜底规划：诊断式 DAG（总量对比 -> 因子分解 -> 维度下钻 -> 综合）。
 
     触发词：为什么/下滑/下降/上涨/增长/归因/原因。其余问题走单查询+综合。
+
+    诊断 DAG 强制分层（先因子后维度，审计修复 M2）：
+    1. s1(query)：两期总量 + 驱动因子（orders/buyers）同源落库；
+    2. s2(analyze)：乘法因子分解（GMV = 买家数 × 人均订单数 × 客单价），
+       先定位"量跌还是价跌"；
+    3. s3(analyze)：维度信息增益下钻（显式维度优先，否则候选池择优），
+       定位"哪个维度-取值是主因"；s2/s3 的产物共同喂养综合。
     """
     diagnostic = any(
         w in query for w in ("为什么", "下滑", "下降", "下跌", "上涨", "增长", "归因", "原因")
@@ -144,20 +225,37 @@ def _heuristic_plan(query: str) -> list[PlanStep]:
             PlanStep(id="s1", goal=f"查询回答问题所需数据：{query[:40]}", kind="query"),
             PlanStep(id="s2", goal="综合查询结果作答", kind="synthesize", depends_on=["s1"]),
         ]
+    explicit = _explicit_dimensions(query)
+    if explicit:
+        dim_goal = f"按用户指定维度（{'/'.join(explicit)}）做信息增益下钻，输出归因矩阵"
+    else:
+        dim_goal = (
+            f"在候选维度池（{'/'.join(_DIAGNOSTIC_DIM_POOL)}）内做信息增益下钻，"
+            "择优定位主因维度，输出归因矩阵与入选依据"
+        )
     return [
         PlanStep(
             id="s1",
-            goal="取基线期与当前期的指标总量与维度明细（两期对比数据集）",
+            goal="取基线期与当前期的指标总量与驱动因子（订单量/买家数）明细",
             kind="query",
         ),
         PlanStep(
             id="s2",
-            goal="沙箱内做乘法因子分解与维度信息增益下钻，输出归因矩阵",
+            goal="沙箱内做乘法因子分解（GMV = 买家数 × 人均订单数 × 客单价），定位量跌还是价跌",
             kind="analyze",
             depends_on=["s1"],
         ),
         PlanStep(
-            id="s3", goal="汇总根因结论、量化贡献并给出建议", kind="synthesize", depends_on=["s2"]
+            id="s3",
+            goal=dim_goal,
+            kind="analyze",
+            depends_on=["s1"],
+        ),
+        PlanStep(
+            id="s4",
+            goal="汇总根因结论、量化贡献并给出建议",
+            kind="synthesize",
+            depends_on=["s2", "s3"],
         ),
     ]
 
@@ -248,9 +346,15 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """诊断问题的确定性两期 DSL 对（基线 = 前 7 天，当前 = 后 7 天，锚 2024-05）。
 
     时间锚与评测保持一致（AS_OF 2024-06-30 附近的 5 月窗口，mock 数仓覆盖）。
-    附省份维度拆分（审计修复 R2 口径对齐）：两期取数同口径同窗口，沙箱
-    直接在行级明细上做总量对比 + 分省归因——明细合计与总量天然同源，
+    维度口径（审计修复 R2 口径对齐 + M2 维度约束）：两期取数同口径同窗口，
+    沙箱直接在行级明细上做总量对比 + 维度归因——明细合计与总量天然同源，
     杜绝总览 66.93 万 vs 拆分 61.68 万式的口径矛盾触发无谓重规划。
+
+    维度选择（M2 回归锚点：此前硬编码 ``dimensions=[province]``，用户问
+    "为什么下滑"却没提省份时仍机械走分省）：
+    - 用户显式点名维度（"按品类/按地区定位"）=> 只取点名维度；
+    - 未显式点名 => 取联合候选池（province + category），分析层按信息增益
+      裁决主因维度并给出入选依据，不再默认分省。
 
     驱动因子随取数一并落库（回归锚点：此前只取 GMV 单指标，反思器看到
     "缺订单量/客单价/流量归因"就判不充分，重规划又取同一份数据，空转至
@@ -263,10 +367,11 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
         {"kind": "aggregate", "field": "order_id", "agg": "count", "alias": "orders"},
         {"kind": "aggregate", "field": "user_id", "agg": "count_distinct", "alias": "buyers"},
     ]
+    dimensions = [{"field": f} for f in _diagnostic_dimension_pool(query)]
     return (
         {
             "metrics": [dict(m) for m in metrics],
-            "dimensions": [{"field": "province"}],
+            "dimensions": [dict(d) for d in dimensions],
             "filters": [{"field": "pay_status", "operator": "eq", "value": "SUCCESS"}],
             "time_filter": {
                 "range_type": "absolute",
@@ -275,7 +380,7 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
         },
         {
             "metrics": [dict(m) for m in metrics],
-            "dimensions": [{"field": "province"}],
+            "dimensions": [dict(d) for d in dimensions],
             "filters": [{"field": "pay_status", "operator": "eq", "value": "SUCCESS"}],
             "time_filter": {
                 "range_type": "absolute",
@@ -288,7 +393,7 @@ def _diagnostic_dsl_pair(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
 def _scalar_dsl(query: str) -> dict[str, Any]:
     """非诊断问题的确定性单期总量 DSL（标量问题附维度与因子无意义）。
 
-    与诊断路径严格区分：诊断取两期分省明细 + 驱动因子；标量问题只回答
+    与诊断路径严格区分：诊断取两期维度明细 + 驱动因子；标量问题只回答
     "这个数是多少"，多取指标会让"查询答案"式的单值呈现失效。
     """
     return {
@@ -609,24 +714,52 @@ def _resolve_step_inputs(state: AgentState, step: PlanStep) -> list[str]:
 def _analysis_template(state: AgentState, step: PlanStep) -> str:
     """analyze 步骤的代码来源优先级：LLM Coder 产码（已静态校验）> 确定性技能模板。
 
-    模板把本步骤依赖的取数产物（两期分省明细）读入，完成总量对比 + 分省
-    加法归因（Δ、贡献占比、主要矛盾省份）+ 分省对比 ECharts——综合节点的
-    "驱动因素分析/区域归因定位"段直接消费该产物。
+    确定性模板按步骤目标分流（先因子后维度，审计修复 M2）：
+    - 目标含"因子/分解" => ``_factor_template``：乘法因子分解（量跌还是价跌）；
+    - 其余（维度下钻/归因定位）=> ``_drilldown_template``：多维度信息增益下钻，
+      择优渲染主因维度图并给出"入选维度"的解释话术；
+    - 无可用输入（如纯标量问题被规划成 analyze）=> ``_scalar_template``。
+
+    模板读取本步骤依赖的取数产物（两期明细），产物结构随数据列自动适配，
+    综合节点直接消费 summary（table/findings/extra）。
     """
     if step.code:
         return step.code
     inputs = _resolve_step_inputs(state, step)
+    if not inputs:
+        return _SCALAR_ANALYSIS_TEMPLATE
+    if "因子" in step.goal or "分解" in step.goal:
+        return _factor_template(inputs)
+    return _drilldown_template(inputs)
+
+
+_SCALAR_ANALYSIS_TEMPLATE = """
+save_summary(
+    title="数据概览",
+    metrics={},
+    table={"columns": [], "rows": []},
+    findings=["本轮无维度明细可取，仅回到取数结果作答。"],
+    extra={},
+)
+"""
+
+
+def _factor_template(inputs: list[str]) -> str:
+    """乘法因子分解模板：GMV = 买家数 × 人均订单数 × 客单价（对数链式归因）。
+
+    反思器会检查"订单量/客单价/买家数等驱动因素"是否被归因；取数阶段已把
+    orders/buyers 与 GMV 同源落库，此处直接做乘法分解，避免"有数据未分析"
+    触发无谓重规划（重规划只会取回同一份数据）。
+    """
     baseline_name = inputs[0] if inputs else ""
     current_name = inputs[1] if len(inputs) > 1 else (inputs[0] if inputs else "")
     return f"""
 import pandas as pd
-import json
 import math
 
 baseline_df = read_input("{baseline_name}")
 current_df = read_input("{current_name}")
 
-# —— 总量对比（两期分省明细同口径，sum 即总量）——
 b_total = float(baseline_df["gmv"].sum()) if "gmv" in baseline_df.columns else 0.0
 c_total = float(current_df["gmv"].sum()) if "gmv" in current_df.columns else 0.0
 delta = c_total - b_total
@@ -636,52 +769,12 @@ findings = [
     f"GMV 从 {{b_total:.2f}} 变至 {{c_total:.2f}}，{{direction}} {{abs(change):.1%}}"
 ]
 metrics = {{"baseline": b_total, "current": c_total, "delta": delta}}
+table = {{"columns": ["factor", "baseline", "current", "change_rate", "share"], "rows": []}}
 
-# —— 分省加法归因（审计修复 R1：提供地区明细与主要矛盾，不再只有对比图）——
-table = {{"columns": ["province", "baseline", "current", "delta", "share"], "rows": []}}
-if "province" in baseline_df.columns and "province" in current_df.columns:
-    b_by = baseline_df.groupby("province")["gmv"].sum()
-    c_by = current_df.groupby("province")["gmv"].sum()
-    b_al, c_al = b_by.align(c_by, fill_value=0.0)
-    deltas = (c_al - b_al)
-    abs_sum = float(deltas.abs().sum())
-    rows = [
-        {{
-            "province": str(p),
-            "baseline": round(float(b_al[p]), 2),
-            "current": round(float(c_al[p]), 2),
-            "delta": round(float(deltas[p]), 2),
-            "share": round(float(deltas[p]) / abs_sum, 4) if abs_sum else 0.0,
-        }}
-        for p in deltas.index
-    ]
-    rows.sort(key=lambda r: abs(r["delta"]), reverse=True)
-    table["rows"] = rows[:20]
-    if rows:
-        top = rows[0]
-        findings.append(
-            f"主要矛盾省份 [{{top['province']}}]：{{top['baseline']:.2f}} -> "
-            f"{{top['current']:.2f}}（Δ{{top['delta']:+.2f}}），"
-            f"贡献了 {{abs(top['share']):.0%}} 的总偏差"
-        )
-        for r in rows[1:3]:
-            findings.append(
-                f"次要贡献省份 [{{r['province']}}] 贡献 {{abs(r['share']):.0%}}"
-                f"（Δ{{r['delta']:+.2f}}）"
-            )
-else:
-    findings.append("两期数据缺少省份维度列，无法做分省归因定位")
-
-# —— 驱动因子分解（GMV = 买家数 × 人均订单数 × 客单价，对数链式归因）——
-# 反思器会检查"订单量/客单价/买家数等驱动因素"是否被归因；取数阶段已把
-# orders/buyers 与 GMV 同源落库，此处直接做乘法分解，避免"有数据未分析"
-# 触发无谓重规划（重规划只会取回同一份数据）。
-factor_table = {{"columns": ["factor", "baseline", "current", "change_rate", "share"], "rows": []}}
-factor_metrics = {{}}
 if all(col in baseline_df.columns and col in current_df.columns for col in ("orders", "buyers")):
 
     def _driver_factors(frame):
-        # 把一期明细聚合为乘法因子组（买家数 × 人均订单数 × 客单价 = GMV）
+        # 一期明细聚合为乘法因子组（买家数 × 人均订单数 × 客单价 = GMV）
         gmv_sum = float(frame["gmv"].sum())
         orders_sum = float(frame["orders"].sum())
         buyers_sum = float(frame["buyers"].sum())
@@ -693,17 +786,13 @@ if all(col in baseline_df.columns and col in current_df.columns for col in ("ord
 
     base_factors = _driver_factors(baseline_df)
     curr_factors = _driver_factors(current_df)
-    metrics["orders_baseline"] = base_factors["买家数"] * base_factors["人均订单数"]
-    metrics["orders_current"] = curr_factors["买家数"] * curr_factors["人均订单数"]
-    if all(v > 0 for v in base_factors.values()) and all(
-        v > 0 for v in curr_factors.values()
-    ):
+    if all(v > 0 for v in base_factors.values()) and all(v > 0 for v in curr_factors.values()):
         log_deltas = {{
             k: math.log(curr_factors[k]) - math.log(base_factors[k]) for k in base_factors
         }}
         abs_log = sum(abs(v) for v in log_deltas.values())
         for k in base_factors:
-            factor_table["rows"].append(
+            table["rows"].append(
                 {{
                     "factor": k,
                     "baseline": round(base_factors[k], 4),
@@ -712,21 +801,16 @@ if all(col in baseline_df.columns and col in current_df.columns for col in ("ord
                     "share": round(log_deltas[k] / abs_log, 4) if abs_log else 0.0,
                 }}
             )
-        factor_table["rows"].sort(key=lambda r: abs(r["share"]), reverse=True)
-        factor_metrics = {{
-            "baseline": {{k: round(v, 4) for k, v in base_factors.items()}},
-            "current": {{k: round(v, 4) for k, v in curr_factors.items()}},
-        }}
-        top_factor = factor_table["rows"][0]
+        table["rows"].sort(key=lambda r: abs(r["share"]), reverse=True)
+        top_factor = table["rows"][0]
         findings.append(
             f"驱动因子分解（GMV = 买家数 × 人均订单数 × 客单价）：主要因子 "
             f"[{{top_factor['factor']}}] 变化 {{top_factor['change_rate']:+.1%}}，"
             f"贡献了 {{abs(top_factor['share']):.0%}} 的总偏差"
         )
-        for r in factor_table["rows"][1:]:
+        for r in table["rows"][1:]:
             findings.append(
-                f"因子 [{{r['factor']}}] 变化 {{r['change_rate']:+.1%}}，"
-                f"贡献 {{abs(r['share']):.0%}}"
+                f"因子 [{{r['factor']}}] 变化 {{r['change_rate']:+.1%}}，贡献 {{abs(r['share']):.0%}}"
             )
     else:
         findings.append("因子存在零值，乘法对数分解不适用，仅呈现加法归因")
@@ -734,24 +818,176 @@ else:
     findings.append("本轮数据未覆盖订单量/买家数，驱动因子分解无法开展")
 
 save_summary(
-    title="两期对比与分省归因",
+    title="驱动因子分解",
     metrics=metrics,
     table=table,
     findings=findings,
-    extra={{"factor_table": factor_table, "factor_metrics": factor_metrics}},
+    extra={{}},
 )
-province_rows = table["rows"]
-save_echarts_spec({{
-    "title": {{"text": "分省 GMV 两期对比（归因定位）"}},
-    "tooltip": {{}},
-    "legend": {{"data": ["基线期", "当前期"]}},
-    "xAxis": {{"type": "category", "data": [r["province"] for r in province_rows]}},
-    "yAxis": {{"type": "value"}},
-    "series": [
-        {{"name": "基线期", "type": "bar", "data": [r["baseline"] for r in province_rows]}},
-        {{"name": "当前期", "type": "bar", "data": [r["current"] for r in province_rows]}},
+"""
+
+
+def _drilldown_template(inputs: list[str]) -> str:
+    """多维度信息增益下钻模板（审计修复 M2：不再默认分省）。
+
+    - 候选维度 = 两期明细里实际存在的字符串维度列（province/category/brand…），
+      由每维度的偏差集中度计算信息增益并降序排序；
+    - 入选维度 = 信息增益最高者（显式维度已由取数层收窄，模板不再需要裁决）；
+    - findings 首条给出"入选依据"话术（扫描了几个候选维度、谁胜出、依据数值），
+      杜绝"没问却下钻"的突兀感；
+    - 主归因矩阵与 ECharts 只渲染入选维度（分省不再是默认主图）；
+    - 数值自洽：加法贡献 Δ 之和 == 总量差，share 按 |Δ| 归一。
+    """
+    baseline_name = inputs[0] if inputs else ""
+    current_name = inputs[1] if len(inputs) > 1 else (inputs[0] if inputs else "")
+    labels_literal = json.dumps(_DIMENSION_LABELS, ensure_ascii=False)
+    return f"""
+import pandas as pd
+import json
+import math
+
+baseline_df = read_input("{baseline_name}")
+current_df = read_input("{current_name}")
+
+# 维度字段 -> 中文标签（叙述与图表标题人读化；矩阵列头保留字段名供数据审计）
+_DIM_LABELS = json.loads({labels_literal!r})
+
+
+def _dim_label(field):
+    return _DIM_LABELS.get(field, field)
+
+
+# —— 总量对比（两期明细同口径，sum 即总量）——
+b_total = float(baseline_df["gmv"].sum()) if "gmv" in baseline_df.columns else 0.0
+c_total = float(current_df["gmv"].sum()) if "gmv" in current_df.columns else 0.0
+delta = c_total - b_total
+direction = "下滑" if delta < 0 else "增长"
+change = delta / b_total if b_total else 0.0
+findings = [
+    f"GMV 从 {{b_total:.2f}} 变至 {{c_total:.2f}}，{{direction}} {{abs(change):.1%}}"
+]
+metrics = {{"baseline": b_total, "current": c_total, "delta": delta}}
+key_span = abs(delta) if abs(delta) > 1e-12 else 1.0
+
+# —— 候选维度自动发现（两期共有、非指标列的字符串维度）——
+# 仅按 dtype 名称识别（兼容 pandas 各版本：object / string / str / category），
+# 不用 pd.api.types 探测——沙箱 AST 守卫对深层属性访问更严格。
+_METRIC_COLS = {{"gmv", "orders", "buyers"}}
+
+
+def _is_dimension_col(series):
+    dtype_name = str(series.dtype).lower()
+    return any(tok in dtype_name for tok in ("object", "string", "str", "category"))
+
+
+_candidates = [
+    c
+    for c in baseline_df.columns
+    if c in current_df.columns and c not in _METRIC_COLS and _is_dimension_col(baseline_df[c])
+]
+ranked = []
+if _candidates and "gmv" in baseline_df.columns and "gmv" in current_df.columns:
+    for col in _candidates:
+        b_by = baseline_df.groupby(col)["gmv"].sum()
+        c_by = current_df.groupby(col)["gmv"].sum()
+        b_al, c_al = b_by.align(c_by, fill_value=0.0)
+        deltas = c_al - b_al
+        # 偏差绝对值分布（占该维度总偏差的比例）：越集中 => 熵越小 => 增益越大。
+        # 均匀熵基准取该维度取值数（信息增益 = log(n) - H），跨维度可比。
+        abs_deltas = {{str(p): abs(float(deltas[p])) for p in deltas.index}}
+        abs_sum = sum(abs_deltas.values())
+        n_vals = max(len(abs_deltas), 1)
+        uniform = math.log(n_vals) if n_vals > 1 else 0.0
+        norm = [v / abs_sum for v in abs_deltas.values() if v > 0] if abs_sum else []
+        entropy = -sum(p * math.log(p) for p in norm if p > 0)
+        gain = uniform - entropy
+        top_key = max(abs_deltas, key=abs_deltas.get) if abs_deltas else ""
+        ranked.append(
+            {{
+                "dimension": str(col),
+                "gain": round(gain, 4),
+                "concentration": round(max(norm) if norm else 0.0, 4),
+                "top_value": top_key,
+                "share": round(abs_deltas.get(top_key, 0.0) / abs_sum, 4) if abs_sum else 0.0,
+                "rows": [
+                    {{
+                        "value": str(p),
+                        "baseline": round(float(b_al[p]), 2),
+                        "current": round(float(c_al[p]), 2),
+                        "delta": round(float(deltas[p]), 2),
+                        "share": round(abs(float(deltas[p])) / key_span, 4),
+                    }}
+                    for p in deltas.index
+                ],
+            }}
+        )
+    ranked.sort(key=lambda r: r["gain"], reverse=True)
+
+primary = ranked[0] if ranked else None
+if primary:
+    findings.insert(
+        0,
+        f"经 {{len(_candidates)}} 个候选维度信息增益扫描，维度 [{{_dim_label(primary['dimension'])}}] "
+        f"的偏差最集中（信息增益 {{primary['gain']:.4f}}、集中度 {{primary['concentration']:.0%}}），"
+        f"其取值 [{{primary['top_value']}}] 占该维度偏差 {{primary['share']:.0%}}，"
+        f"优先下钻该维度定位主因",
+    )
+
+# —— 主归因矩阵（只渲染入选维度）+ 次要维度汇总 ——
+if primary:
+    rows = sorted(primary["rows"], key=lambda r: abs(r["delta"]), reverse=True)
+    table = {{
+        "columns": [primary["dimension"], "baseline", "current", "delta", "share"],
+        "rows": [[r["value"], r["baseline"], r["current"], r["delta"], r["share"]] for r in rows[:20]],
+    }}
+    _label = _dim_label(primary["dimension"])
+    top = rows[0]
+    findings.append(
+        f"主要矛盾（{{_label}}）[{{top['value']}}]：{{top['baseline']:.2f}} -> "
+        f"{{top['current']:.2f}}（Δ{{top['delta']:+.2f}}），贡献了 {{abs(top['share']):.0%}} 的总偏差"
+    )
+    for r in rows[1:3]:
+        findings.append(
+            f"次要贡献（{{_label}}）[{{r['value']}}] 贡献 {{abs(r['share']):.0%}}"
+            f"（Δ{{r['delta']:+.2f}}）"
+        )
+    if len(ranked) > 1:
+        others = "、".join(
+            f"{{_dim_label(r['dimension'])}}(增益 {{r['gain']:.3f}})" for r in ranked[1:]
+        )
+        findings.append(f"其余候选维度信息增益较低，未入选主因定位：{{others}}")
+else:
+    table = {{"columns": [], "rows": []}}
+    findings.append("两期数据缺少可用维度列，无法做维度归因定位")
+
+# —— 维度信息增益全景（全部候选，供反思/综合判定归因是否充分）——
+gain_table = {{
+    "columns": ["dimension", "gain", "concentration", "top_value", "share"],
+    "rows": [
+        [r["dimension"], r["gain"], r["concentration"], r["top_value"], r["share"]] for r in ranked
     ],
-}})
+}}
+
+save_summary(
+    title="维度信息增益归因",
+    metrics=metrics,
+    table=table,
+    findings=findings,
+    extra={{"gain_table": gain_table, "primary_dimension": primary["dimension"] if primary else ""}},
+)
+if primary:
+    _rows = table["rows"]
+    save_echarts_spec({{
+        "title": {{"text": f"{{_dim_label(primary['dimension'])}} 两期 GMV 对比（信息增益下钻）"}},
+        "tooltip": {{}},
+        "legend": {{"data": ["基线期", "当前期"]}},
+        "xAxis": {{"type": "category", "data": [r[0] for r in _rows]}},
+        "yAxis": {{"type": "value"}},
+        "series": [
+            {{"name": "基线期", "type": "bar", "data": [r[1] for r in _rows]}},
+            {{"name": "当前期", "type": "bar", "data": [r[2] for r in _rows]}},
+        ],
+    }})
 """
 
 
@@ -1198,9 +1434,10 @@ def _dataset_analyst_markdown(
 def _summary_analyst_markdown(summary: dict[str, Any]) -> list[str]:
     """沙箱 summary -> 分析师叙述（数值万元/百分比化，禁 raw dict 直出）。
 
-    table 行（分省归因矩阵）渲染为归因表格；metrics 键值译为人读短语。
-    extra.factor_table（驱动因子分解）另起小节渲染——因子是比值/人数，
-    不做万元换算。
+    table 行按首列是因子名（factor）还是维度取值自动分流渲染：
+    - factor 形态 => 驱动因子小节（值为比值/人数，不做万元换算）；
+    - 其余 => 维度归因矩阵小节（baseline/current/delta 按万元）。
+    extra.gain_table（维度信息增益全景）另起小节渲染。
     """
     lines: list[str] = []
     title = summary.get("title", "")
@@ -1215,13 +1452,19 @@ def _summary_analyst_markdown(summary: dict[str, Any]) -> list[str]:
             for k, v in metrics.items()
         )
         lines.append(f"- 关键指标：{rendered}")
-    lines.extend(_render_table(summary.get("table") or {}, limit=10))
-    factor_table = (summary.get("extra") or {}).get("factor_table") or {}
-    factor_rows = factor_table.get("rows") or []
-    if factor_rows:
+    table = summary.get("table") or {}
+    columns = [str(c) for c in (table.get("columns") or [])]
+    if columns and columns[0] == "factor":
         lines.append("")
         lines.append("**驱动因子分解（GMV = 买家数 × 人均订单数 × 客单价）**")
-        lines.extend(_render_table(factor_table, limit=10, currency=False))
+        lines.extend(_render_table(table, limit=10, currency=False))
+    else:
+        lines.extend(_render_table(table, limit=10))
+    gain_table = (summary.get("extra") or {}).get("gain_table") or {}
+    if gain_table.get("rows"):
+        lines.append("")
+        lines.append("**维度信息增益全景（候选维度扫描结果）**")
+        lines.extend(_render_table(gain_table, limit=10, currency=False))
     return lines
 
 
@@ -1380,23 +1623,31 @@ def _degraded_report(state: AgentState) -> str:
 
 
 def _degraded_detail_lines(state: AgentState) -> list[str]:
-    """从已物化数据集提取人读省份明细（降级简报用）。
+    """从已物化数据集提取人读维度明细（降级简报用）。
 
-    只处理两期分省结构（province + gmv 列，诊断兜底口径）；结构不符时
-    返回空列表由调用方省略小节——严禁把原始行直接吐给前端。
+    只处理两期维度明细结构（首个字符串维度列 + gmv 列，诊断兜底口径）；
+    结构不符时返回空列表由调用方省略小节——严禁把原始行直接吐给前端。
+    维度列按数据实际形态识别（province/category 均可），不再硬编码省份。
     """
     workspace = workspace_path(state)
     period_values: list[dict[str, float]] = []
+    dim_col = ""
     for ref in state.datasets.values():
         preview = _preview_rows(str(workspace / "inputs" / ref.get("path", "")))
         cols = [str(c) for c in ref.get("columns", [])]
-        if not preview or "province" not in cols or "gmv" not in cols:
+        if not preview or "gmv" not in cols:
+            return []
+        dims = [c for c in cols if c not in ("gmv", "orders", "buyers")]
+        if not dims:
+            return []
+        dim_col = dim_col or dims[0]
+        if dim_col not in cols:
             return []
         values: dict[str, float] = {}
-        p_idx, v_idx = cols.index("province"), cols.index("gmv")
+        d_idx, v_idx = cols.index(dim_col), cols.index("gmv")
         for row in preview:
             try:
-                values[str(row[p_idx])] = values.get(str(row[p_idx]), 0.0) + float(row[v_idx])
+                values[str(row[d_idx])] = values.get(str(row[d_idx]), 0.0) + float(row[v_idx])
             except (TypeError, ValueError):
                 continue
         period_values.append(values)
@@ -1408,7 +1659,7 @@ def _degraded_detail_lines(state: AgentState) -> list[str]:
         key=lambda item: abs(item[1]),
         reverse=True,
     )
-    lines = ["| 省份 | 基线期 | 当前期 | 变化 |", "| --- | --- | --- | --- |"]
+    lines = [f"| {dim_col} | 基线期 | 当前期 | 变化 |", "| --- | --- | --- | --- |"]
     for name, delta in deltas[:5]:
         lines.append(
             f"| {name} | {_fmt_wan(base.get(name, 0.0))} | {_fmt_wan(curr.get(name, 0.0))} "
