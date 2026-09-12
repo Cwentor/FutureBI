@@ -507,3 +507,156 @@ def test_critic_replans_and_records_progress_fingerprint(monkeypatch):
     assert out.phase == "plan"
     assert out.error_context.retries == 1
     assert out.last_replan_fingerprint == nodes._artifact_fingerprint(state)
+
+
+# --------------------------------------------------------------------------- #
+# 无数据诚实守卫（2026-09 审计修复：编造时段严禁产出归因报告）
+# --------------------------------------------------------------------------- #
+def test_parse_explicit_time_window():
+    """显式年份/月份解析：年月 / 整年；无年份月份返回 None 由调用方锚定。"""
+    from agent.time_utils import parse_explicit_time_window
+
+    assert parse_explicit_time_window("分析一下 2030 年 5 月第二周比第三周 GMV 下滑") == (
+        "2030-05-01",
+        "2030-06-01",
+    )
+    assert parse_explicit_time_window("2024年GMV是多少") == ("2024-01-01", "2025-01-01")
+    assert parse_explicit_time_window("12月GMV是多少") is None
+    assert parse_explicit_time_window("上个月GMV") is None
+
+
+def test_time_window_outside_domain():
+    """数据域守卫判据：窗口整体晚于数据域上界 = 必然空集（确定性可证）。"""
+    from agent.time_utils import time_window_outside_domain
+    from semantic.dsl_schema import TimeFilter
+
+    future = TimeFilter.model_validate(
+        {"range_type": "absolute", "absolute": {"start": "2030-05-01", "end": "2030-06-01"}}
+    )
+    past = TimeFilter.model_validate(
+        {"range_type": "absolute", "absolute": {"start": "2024-05-01", "end": "2024-06-01"}}
+    )
+    assert time_window_outside_domain(future) is True
+    assert time_window_outside_domain(past) is False
+
+
+def test_diagnostic_dsl_pair_respects_explicit_time():
+    """兜底两期对必须尊重用户显式时间（严禁静默替换成 2024-05 域内窗口）。"""
+    from core.orchestrator.nodes import _diagnostic_dsl_pair, _scalar_dsl
+
+    baseline, current = _diagnostic_dsl_pair("分析一下 2030 年 5 月 GMV 下滑的原因")
+    assert baseline["time_filter"]["absolute"]["start"] == "2030-05-01"
+    assert current["time_filter"]["absolute"]["end"] == "2030-06-01"
+    # 两期相邻不重叠（半开区间共用分界）
+    assert baseline["time_filter"]["absolute"]["end"] == current["time_filter"]["absolute"]["start"]
+
+    scalar = _scalar_dsl("2030 年 5 月的 GMV 总额是多少？")
+    assert scalar["time_filter"]["absolute"] == {"start": "2030-05-01", "end": "2030-06-01"}
+
+    # 无显式时间 => 缺省锚不变（评测确定性回归锚点）
+    b_default, c_default = _diagnostic_dsl_pair("为什么 GMV 下滑了")
+    assert b_default["time_filter"]["absolute"] == {"start": "2024-05-01", "end": "2024-05-08"}
+    assert c_default["time_filter"]["absolute"] == {"start": "2024-05-08", "end": "2024-05-15"}
+
+
+def test_run_agent_fabricated_year_reports_no_data(tmp_path, monkeypatch):
+    """E2E：编造年份（2030）严禁产出归因报告，必须如实说明无数据。
+
+    回归锚点（2026-09 审计）：此前兜底窗口硬编码 2024-05，用域内数据冒充
+    用户问的 2030 时段产出"下滑归因"报告 = 数据造假。
+    """
+    from config import settings
+
+    monkeypatch.setattr(settings, "WORKSPACE_ROOT", tmp_path)
+    trace = run_agent(
+        "分析一下 2030 年 5 月第二周比第三周 GMV 下滑的原因，按地区定位",
+        session_id="fab-year",
+    )
+    assert trace.phase == "done"
+    # 严禁沙箱假产物：无数据时不做因子分解/维度下钻
+    assert not any(a["kind"] == "summary" for a in trace.artifacts)
+    assert not any(a["kind"] == "echarts" for a in trace.artifacts)
+    # 取数被守卫拦截（不产出数据集）
+    query_steps = [s for s in trace.steps if s["tool"] == "execute_dsl_query"]
+    assert query_steps and all(not s["ok"] for s in query_steps)
+    # 报告如实说明超界与数据域边界，且不出现编造结论话术
+    assert "无任何数据" in trace.report
+    assert "2024-06-30" in trace.report
+    assert "驱动因子分解" not in trace.report
+    assert "归因矩阵" not in trace.report
+
+
+def test_critic_short_circuits_on_no_data_reason(monkeypatch):
+    """时间域守卫拦截后 critic 直接转综合（严禁重规划空转、不进 LLM 反思）。"""
+    import core.orchestrator.nodes as nodes
+
+    calls: list[int] = []
+    monkeypatch.setattr(nodes, "_resolve_llm", lambda: calls.append(1) or object())
+    state = _critic_state(
+        no_data_reason="查询时间范围 2030-05-01 ~ 2030-06-01 整体晚于数仓数据域上界",
+        datasets={},
+        artifacts=[],
+    )
+    out = nodes.critic_node(state)
+    assert out.phase == "synthesize"
+    assert out.error_context.retries == 0
+    assert not calls
+
+
+def test_critic_short_circuits_on_all_empty_datasets(monkeypatch):
+    """全部数据集 0 行：critic 转综合如实说明（不判'缺归因产物'触发重规划）。"""
+    import core.orchestrator.nodes as nodes
+
+    calls: list[int] = []
+    monkeypatch.setattr(nodes, "_resolve_llm", lambda: calls.append(1) or object())
+    state = _critic_state(
+        datasets={
+            "s1_v0": {"path": "a.parquet", "rows": 0, "columns": ["province", "gmv"]},
+            "s1_v1": {"path": "b.parquet", "rows": 0, "columns": ["province", "gmv"]},
+        },
+        artifacts=[],
+    )
+    out = nodes.critic_node(state)
+    assert out.phase == "synthesize"
+    assert out.error_context.retries == 0
+    assert not calls
+
+
+def test_analysis_template_guards_empty_inputs():
+    """依赖数据集全 0 行 => 无匹配数据模板（严禁在空 DataFrame 上跑分解/下钻）。"""
+    import core.orchestrator.nodes as nodes
+    from core.orchestrator.state import AgentState, PlanStep
+
+    state = AgentState(
+        user_query="分析一下 2024 年 5 月 GMV 下滑的原因",
+        plan_steps=[
+            PlanStep(id="s1", goal="取数", kind="query"),
+            PlanStep(id="s2", goal="沙箱内做乘法因子分解", kind="analyze", depends_on=["s1"]),
+        ],
+        datasets={"s1_v0": {"path": "a.parquet", "rows": 0, "columns": ["province", "gmv"]}},
+        step_outputs={"s1": ["s1_v0"]},
+    )
+    code = nodes._analysis_template(state, state.plan_steps[1])
+    assert "无匹配数据" in code
+    # 严禁落到因子分解模板（不读数据集、不产出分解小节）
+    assert "read_input" not in code
+    assert "驱动因子分解" not in code
+
+
+def test_synthesize_no_data_skips_llm(monkeypatch):
+    """无数据时 synthesize 跳过 LLM 综合，输出确定性数据说明（严禁编故事）。"""
+    import core.orchestrator.nodes as nodes
+    from core.orchestrator.state import AgentState
+
+    calls: list[str] = []
+    monkeypatch.setattr(nodes, "_resolve_llm", lambda: object())
+    monkeypatch.setattr(
+        nodes, "_synthesize_with_llm", lambda state, material: calls.append(material)
+    )
+    state = AgentState(user_query="2030 年 5 月 GMV 下滑原因", no_data_reason="查询时间范围超界")
+    out = nodes.synthesize_node(state)
+    assert out.phase == "done"
+    assert not calls
+    assert "无法进行" in out.report
+    assert "2024-06-30" in out.report
+    assert "不会以其他时段的数据代替作答" in out.report
