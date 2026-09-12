@@ -1,4 +1,4 @@
-/* DataAgent 主控制台前端逻辑（双栏 Data Agent 工作台）。
+/* DataAgent 主控制台前端逻辑（三栏 Data Agent 工作台）。
  *
  * 鉴权铁律（P0）：
  * - 页面启动只允许先调用轻量身份校验端点 /api/auth/me；校验通过前严禁发起
@@ -8,7 +8,8 @@
  *
  * 主流程（SSE 事件驱动）：
  *   提问 -> GET /api/v1/agent/chat/stream（fetch 流式）-> AgentStreamEvent
- *   -> AgentStore（plan/timeline/artifacts/hitl）-> 左栏执行流 + 右栏产物画布。
+ *   -> AgentStore（plan/timeline/artifacts/hitl）
+ *   -> 中央对话流 + 右侧执行流程 + 侧边栏切换的产物视图。
  */
 (function () {
   "use strict";
@@ -134,7 +135,7 @@
     renderUserCenter(user);
     AgentStreamUI.init();
     AgentCanvas.init();
-    AgentHeaderUI.init();
+    AgentSidebarUI.init();
     initAgentStatus();
     bindEvents();
     fillModelSwitch();
@@ -234,19 +235,11 @@
     return { provider_id: v.slice(0, idx), model_id: v.slice(idx + 1) };
   }
 
+  /** 模型选择可用性：无任何可选模型时展示配置引导横幅。 */
   function updateModelIndicator() {
     var sel = $("model-switch");
-    var text = $("model-indicator-text");
-    var dot = $("model-dot");
     var options = Array.prototype.slice.call(sel.options || []);
     var hasChoice = options.length > 1;
-    if (sel.value) {
-      var opt = sel.options[sel.selectedIndex];
-      text.textContent = opt ? opt.textContent.replace(/\s+·.*$/, "") : "默认模型";
-    } else {
-      text.textContent = hasChoice ? "默认模型（自动选择）" : "未配置模型";
-    }
-    dot.classList.toggle("off", !hasChoice);
     $("model-banner").classList.toggle("hidden", hasChoice);
   }
 
@@ -738,10 +731,10 @@
         break;
 
       case "artifact_emit":
+        // 主对话页只用于对话：产物入账后不自动跳转视图，
+        // 由侧边栏徽标提示（计数亮起），用户自行切换查看。
         if (p.artifact) {
           AgentStore.pushArtifact(p.artifact);
-          if (p.artifact.type === "echarts") { AgentCanvas.showTab("charts"); }
-          if (p.artifact.type === "markdown_report") { AgentCanvas.showTab("report"); }
         }
         break;
 
@@ -799,9 +792,9 @@
       streamHandlers()
     );
     activeStream = stream;
-    window.__activeStream = stream; // 供 Header「新线程」中断当前流
-    // 线程历史：提交即记录（含当前事件数，供历史面板展示规模）
-    AgentHeaderUI.recordThread(q, AgentStore.get().timelineEvents.length);
+    window.__activeStream = stream; // 供「新对话」中断当前流
+    // 线程历史：提交即记录（含当前事件数，供历史列表展示规模）
+    AgentSidebarUI.recordThread(q, AgentStore.get().timelineEvents.length);
   }
 
   function bindEvents() {

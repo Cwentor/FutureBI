@@ -1,27 +1,39 @@
-/* 左栏执行流渲染（AgentChatStream，窗口化虚拟渲染）。
+/* 双列表执行流渲染（AgentChatStream 拆分渲染）。
  *
- * 数据模型：store.timelineEvents 全量保留（不丢任何事件）；
- * DOM 模型：超过 VIRTUALIZE_THRESHOLD 条后仅渲染可视窗口 ±BUFFER 的条目，
- * 窗口外用上下 spacer 撑起滚动高度（高度 = 实测缓存 itemH[i] 或估算值），
- * 滚动时 rAF 节流滑动窗口。≤阈值时保持简单追加渲染（零虚拟化开销）。
+ * 布局契约：中央对话流（chat）只承载对话语义节点；右侧执行流程（process）
+ * 承载机器执行语义节点。数据源同为 store.timelineEvents（append-only，
+ * 重规划时 plan 项被替换），按 kind 路由：
+ *   chat    -> user / hitl / done / error（低频，简单追加渲染）
+ *   process -> plan / tool / reflection（高频，>50 条启用窗口化虚拟渲染）
+ *
+ * 虚拟化模型：process 列表超过 VIRTUALIZE_THRESHOLD 条后仅渲染可视窗口
+ * ±BUFFER 的条目，窗口外用上下 spacer 撑起滚动高度；滚动时 rAF 节流滑动窗口。
+ * 条目以 uid 键控协调（重规划替换 plan 时不串位），高度按 uid 实测缓存。
  */
 (function () {
   "use strict";
 
-  var ICONS = { query: "⟳", analyze: "⚙", synthesize: "✎" };
   var PLAN_STATUS_ICON = { pending: "○", running: "◌", done: "●", failed: "✕" };
   var PLAN_STATUS_TEXT = { pending: "等待", running: "执行中", done: "完成", failed: "失败" };
   var TOOL_LABELS = AgentProtocol.TOOL_LABELS;
-  var VIRTUALIZE_THRESHOLD = 50; // 超过该事件数后启用窗口化（规格：>50 步虚拟化）
+  var VIRTUALIZE_THRESHOLD = 50; // 超过该条数后启用窗口化（规格：>50 步虚拟化）
   var BUFFER = 6;                // 视口上下各多渲染的条目数
-  var EST_H = { user: 44, plan: 130, tool: 46, reflection: 64, hitl: 150, done: 52, error: 44 };
+  var EST_H = { plan: 130, tool: 46, reflection: 64 };
 
-  var scrollBox, listBox;
+  var CHAT_KINDS = { user: 1, hitl: 1, done: 1, error: 1 };
+
+  var chatScrollBox, chatBox;    // 对话流（中央）
+  var scrollBox, listBox;        // 执行流（右侧）
   var spacerTop, spacerBottom;
-  var stickBottom = true;
-  var itemH = [];        // index -> 实测高度（null = 未渲染，用估算）
-  var windowStart = 0;   // 当前窗口起点
-  var windowEnd = -1;    // 当前窗口终点（不含）
+  var stickChatBottom = true;
+  var stickProcBottom = true;
+  var uidSeq = 0;          // 时间线条目的稳定 uid（重规划替换 plan 不影响他项）
+  var chatScanIdx = 0;         // 对话流已扫描到的事件下标（增量渲染游标）
+  var chatHasItems = false;    // 对话流是否已有条目（空态占位判定）
+  var procItems = [];          // 执行流条目（timeline 的 plan/tool/reflection 子集）
+  var itemH = {};              // uid -> 实测高度（缺省用估算）
+  var windowStart = 0;         // 当前窗口起点
+  var windowEnd = -1;          // 当前窗口终点（不含）
   var rafPending = false;
 
   function $(id) { return document.getElementById(id); }
@@ -32,6 +44,8 @@
   }
 
   function initScroll() {
+    chatScrollBox = $("chat-scroll");
+    chatBox = $("chat-stream");
     scrollBox = $("stream-scroll");
     listBox = $("stream");
     // 虚拟化结构：上下 spacer + 窗口内容
@@ -41,16 +55,24 @@
     spacerBottom.className = "virtual-spacer";
     listBox.insertBefore(spacerTop, listBox.firstChild);
     listBox.appendChild(spacerBottom);
+
+    chatScrollBox.addEventListener("scroll", function () {
+      var near = chatScrollBox.scrollHeight - chatScrollBox.scrollTop - chatScrollBox.clientHeight;
+      stickChatBottom = near < 40;
+    });
     scrollBox.addEventListener("scroll", function () {
       var near = scrollBox.scrollHeight - scrollBox.scrollTop - scrollBox.clientHeight;
-      stickBottom = near < 40; // 距底 40px 内视为贴底
+      stickProcBottom = near < 40; // 距底 40px 内视为贴底
       scheduleWindow();
     });
     window.addEventListener("resize", scheduleWindow);
   }
 
-  function autoScroll() {
-    if (stickBottom) { scrollBox.scrollTop = scrollBox.scrollHeight; }
+  function autoScrollChat() {
+    if (stickChatBottom) { chatScrollBox.scrollTop = chatScrollBox.scrollHeight; }
+  }
+  function autoScrollProc() {
+    if (stickProcBottom) { scrollBox.scrollTop = scrollBox.scrollHeight; }
   }
 
   /** rAF 节流的窗口滑动（scroll/resize 高频触发）。 */
@@ -63,23 +85,28 @@
     });
   }
 
-  // ------------------------------------------------------------ 高度模型
-  function estHeight(items, i) {
-    if (itemH[i]) { return itemH[i]; }
-    return EST_H[items[i].kind] || 56;
+  // ------------------------------------------------------------ 高度模型（执行流）
+  function ensureUid(item) {
+    if (!item.uid) { item.uid = "t" + (++uidSeq); }
+    return item.uid;
+  }
+
+  function estHeight(item) {
+    if (itemH[item.uid]) { return itemH[item.uid]; }
+    return EST_H[item.kind] || 56;
   }
 
   function offsets(items) {
     var prefix = [0];
-    for (var i = 0; i < items.length; i++) { prefix.push(prefix[i] + estHeight(items, i)); }
+    for (var i = 0; i < items.length; i++) { prefix.push(prefix[i] + estHeight(items[i])); }
     return prefix;
   }
 
-  function measureNode(node, idx) {
-    if (node && node.offsetHeight) { itemH[idx] = node.offsetHeight; }
+  function measureNode(node, uid) {
+    if (node && node.offsetHeight) { itemH[uid] = node.offsetHeight; }
   }
 
-  // ------------------------------------------------------------ 各类型节点渲染
+  // ------------------------------------------------------------ 对话流节点
   function elUserMessage(item) {
     var div = document.createElement("div");
     div.className = "msg-user";
@@ -87,6 +114,80 @@
     return div;
   }
 
+  function elDone(item) {
+    var div = document.createElement("div");
+    div.className = "done-card";
+    div.innerHTML = '<span class="r-decision">✓ 分析完成</span>'
+      + '<span class="r-reason">报告与产物已生成。</span> ';
+    var link = document.createElement("button");
+    link.type = "button";
+    link.className = "done-link";
+    link.textContent = "查看报告 →";
+    link.addEventListener("click", function () {
+      if (window.AgentSidebarUI) { AgentSidebarUI.showView("report"); }
+    });
+    div.appendChild(link);
+    return div;
+  }
+
+  function elHitl(item) {
+    var card = document.createElement("div");
+    card.className = "stream-item hitl-card";
+    card.innerHTML = '<div class="hitl-q">' + esc(item.question || "需要补充信息") + "</div>";
+    var opts = item.options || [];
+    if (opts.length) {
+      var row = document.createElement("div");
+      row.className = "hitl-options";
+      opts.forEach(function (o) {
+        var pill = document.createElement("button");
+        pill.type = "button";
+        pill.className = "hitl-pill";
+        pill.dataset.value = o;
+        pill.textContent = o;
+        row.appendChild(pill);
+      });
+      card.appendChild(row);
+    }
+    // 自由输入兜底（无预置选项或选项都不匹配时使用）
+    var inputRow = document.createElement("div");
+    inputRow.className = "hitl-input-row";
+    inputRow.innerHTML = '<input class="hitl-input" placeholder="或输入自定义答复…">'
+      + '<button type="button" class="hitl-pill hitl-send">发送</button>';
+    card.appendChild(inputRow);
+    return card;
+  }
+
+  function elError(item) {
+    var div = document.createElement("div");
+    div.className = "stream-item tool-err";
+    div.style.margin = "0";
+    div.textContent = "执行出错：" + (item.error || "未知错误");
+    return div;
+  }
+
+  function elChatThinking() {
+    var div = document.createElement("div");
+    div.className = "chat-thinking";
+    div.dataset.chatThinking = "1";
+    div.innerHTML = "<span>正在分析</span><span class='dots'></span>";
+    return div;
+  }
+
+  function elChatEmpty() {
+    var div = document.createElement("div");
+    div.className = "chat-empty";
+    div.dataset.chatEmpty = "1";
+    div.innerHTML = '<div><span class="ce-icon">'
+      // Lucide "bot"（ISC License）
+      + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/>'
+      + '<path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg></span></div>'
+      + '<div class="ce-title">向 DataAgent 提问</div>'
+      + '<div class="ce-sub">Agent 将自动规划取数、沙箱分析并生成报告；执行细节见右侧流程。</div>';
+    return div;
+  }
+
+  // ------------------------------------------------------------ 执行流节点
   function elPlanCard(item) {
     var card = document.createElement("div");
     card.className = "stream-item plan-card";
@@ -160,11 +261,7 @@
         + esc(item.input.code) + "</code></pre>";
     }
     if (item.output) {
-      if (item.name === "python_sandbox" && item.input && item.input.code) {
-        body.innerHTML += "<h4>执行结果</h4><pre>" + esc(JSON.stringify(item.output, null, 2)) + "</pre>";
-      } else {
-        body.innerHTML += "<h4>执行结果</h4><pre>" + esc(JSON.stringify(item.output, null, 2)) + "</pre>";
-      }
+      body.innerHTML += "<h4>执行结果</h4><pre>" + esc(JSON.stringify(item.output, null, 2)) + "</pre>";
     }
     if (item.error) {
       body.innerHTML += '<div class="tool-err">' + esc(item.error) + "</div>";
@@ -183,51 +280,7 @@
     return div;
   }
 
-  function elDone(item) {
-    var div = document.createElement("div");
-    div.className = "stream-item reflection-card";
-    div.style.borderLeftColor = "#12b886";
-    div.innerHTML = '<span class="r-decision proceed">✓ 分析完成</span>'
-      + '<div class="r-reason">报告与产物已生成，见右侧画布。</div>';
-    return div;
-  }
-
-  function elHitl(item) {
-    var card = document.createElement("div");
-    card.className = "stream-item hitl-card";
-    card.innerHTML = '<div class="hitl-q">' + esc(item.question || "需要补充信息") + "</div>";
-    var opts = item.options || [];
-    if (opts.length) {
-      var row = document.createElement("div");
-      row.className = "hitl-options";
-      opts.forEach(function (o) {
-        var pill = document.createElement("button");
-        pill.type = "button";
-        pill.className = "hitl-pill";
-        pill.dataset.value = o;
-        pill.textContent = o;
-        row.appendChild(pill);
-      });
-      card.appendChild(row);
-    }
-    // 自由输入兜底（无预置选项或选项都不匹配时使用）
-    var inputRow = document.createElement("div");
-    inputRow.className = "hitl-input-row";
-    inputRow.innerHTML = '<input class="hitl-input" placeholder="或输入自定义答复…">'
-      + '<button type="button" class="hitl-pill hitl-send">发送</button>';
-    card.appendChild(inputRow);
-    return card;
-  }
-
-  function elError(item) {
-    var div = document.createElement("div");
-    div.className = "stream-item tool-err";
-    div.style.margin = "0";
-    div.textContent = "执行出错：" + (item.error || "未知错误");
-    return div;
-  }
-
-  function elThinking() {
+  function elProcThinking() {
     var div = document.createElement("div");
     div.className = "stream-thinking";
     div.dataset.thinking = "1";
@@ -235,18 +288,59 @@
     return div;
   }
 
-  // ------------------------------------------------------------ 窗口化虚拟渲染
+  function elProcEmpty() {
+    var div = document.createElement("div");
+    div.className = "stream-empty";
+    div.dataset.procEmpty = "1";
+    div.innerHTML = "执行流程将在此展示：<br>任务计划（DAG）· 工具调用 · 反思自愈";
+    return div;
+  }
+
   function elItemFor(item) {
-    if (item.kind === "user") { return elUserMessage(item); }
     if (item.kind === "plan") { return elPlanCard(item); }
     if (item.kind === "tool") { return elTool(item); }
     if (item.kind === "reflection") { return elReflection(item); }
-    if (item.kind === "hitl") { return elHitl(item); }
-    if (item.kind === "done") { return elDone(item); }
-    if (item.kind === "error") { return elError(item); }
     return null;
   }
 
+  // ------------------------------------------------------------ 对话流渲染（简单增量追加）
+  function renderChat(state) {
+    var events = state.timelineEvents;
+    // 会话重置（事件数收缩）：全量清空重建
+    var i;
+    if (events.length < chatScanIdx) {
+      chatBox.innerHTML = "";
+      chatScanIdx = 0;
+      chatHasItems = false;
+    }
+    // 增量扫描新事件：对话类追加渲染，机器类跳过（由执行流负责）
+    for (i = chatScanIdx; i < events.length; i++) {
+      var item = events[i];
+      if (!CHAT_KINDS[item.kind]) { continue; }
+      ensureUid(item);
+      var node = item.kind === "user" ? elUserMessage(item)
+        : item.kind === "hitl" ? elHitl(item)
+        : item.kind === "done" ? elDone(item)
+        : elError(item);
+      chatBox.appendChild(node);
+      chatHasItems = true;
+    }
+    chatScanIdx = events.length;
+
+    // 空态占位
+    var empty = chatBox.querySelector("[data-chat-empty]");
+    if (!chatHasItems && !empty) { chatBox.appendChild(elChatEmpty()); }
+    if (chatHasItems && empty) { empty.remove(); }
+
+    // 运行中指示
+    var oldThinking = chatBox.querySelector("[data-chat-thinking]");
+    if (oldThinking) { oldThinking.remove(); }
+    if (state.running && chatHasItems) { chatBox.appendChild(elChatThinking()); }
+
+    autoScrollChat();
+  }
+
+  // ------------------------------------------------------------ 执行流渲染
   /** 计算可视窗口边界（前缀和二分 + BUFFER 外扩，钳制到 [0, n]）。 */
   function windowBounds(items, prefix) {
     var viewportH = scrollBox.clientHeight || 600;
@@ -264,79 +358,93 @@
     return { start: start, end: Math.min(end + BUFFER, items.length) };
   }
 
-  /** 渲染当前窗口：移除窗外 DOM、补齐窗内 DOM、更新 spacer。 */
-  function renderWindow() {
-    var items = AgentStore.get().timelineEvents;
-    if (items.length <= VIRTUALIZE_THRESHOLD) { return; } // 非虚拟化模式
-    var prefix = offsets(items);
-    var w = windowBounds(items, prefix);
-    windowStart = w.start;
-    windowEnd = w.end;
+  /** 键控协调：让 DOM 与 want 序列严格一致（uid 相同复用节点，乱序则移动）。 */
+  function reconcile(want) {
+    var existing = {};
+    var nodes = listBox.querySelectorAll("[data-uid]");
+    for (var k = 0; k < nodes.length; k++) { existing[nodes[k].dataset.uid] = nodes[k]; }
 
-    // 移除窗外节点
-    var rendered = listBox.querySelectorAll("[data-timeline-idx]");
-    for (var k = 0; k < rendered.length; k++) {
-      var idx = Number(rendered[k].dataset.timelineIdx);
-      if (idx < w.start || idx >= w.end) { rendered[k].remove(); }
-    }
-    // 补齐窗内节点（按序插入：SpacerTop 后、SpacerBottom 前）
-    for (var i = w.start; i < w.end; i++) {
-      if (listBox.querySelector('[data-timeline-idx="' + i + '"]')) { continue; }
-      var node = elItemFor(items[i]);
-      if (!node) { continue; }
-      node.dataset.timelineIdx = String(i);
-      listBox.insertBefore(node, spacerBottom);
-      measureNode(node, i);
-    }
-    spacerTop.style.height = prefix[w.start] + "px";
-    spacerBottom.style.height = (prefix[items.length] - prefix[w.end]) + "px";
+    var wantSet = {};
+    want.forEach(function (item) { wantSet[item.uid] = 1; });
+    Object.keys(existing).forEach(function (uid) {
+      if (!wantSet[uid]) { existing[uid].remove(); delete existing[uid]; }
+    });
+
+    var cursor = spacerTop.nextSibling;
+    want.forEach(function (item) {
+      var node = existing[item.uid];
+      if (node) { delete existing[item.uid]; }
+      else {
+        node = elItemFor(item);
+        node.dataset.uid = item.uid;
+        measureNode(node, item.uid);
+      }
+      if (node === cursor) {
+        cursor = node.nextSibling;
+      } else {
+        listBox.insertBefore(node, cursor);
+      }
+    });
   }
 
-  /** 全量渲染入口：≤阈值走简单追加；>阈值走窗口化（数据永不丢弃）。 */
-  function render(state) {
-    // 计划卡状态就地刷新（避免整卡重排）
-    if (state.activePlan.length) { updatePlanCard(state.activePlan); }
+  /** 渲染当前窗口：窗外条目移除、窗内条目补齐、更新 spacer。 */
+  function renderWindow() {
+    if (procItems.length <= VIRTUALIZE_THRESHOLD) { return; } // 非虚拟化模式
+    var prefix = offsets(procItems);
+    var w = windowBounds(procItems, prefix);
+    windowStart = w.start;
+    windowEnd = w.end;
+    reconcile(procItems.slice(w.start, w.end));
+    spacerTop.style.height = prefix[w.start] + "px";
+    spacerBottom.style.height = (prefix[procItems.length] - prefix[w.end]) + "px";
+  }
 
-    var items = state.timelineEvents;
-    if (items.length < itemH.length) {
-      // 会话重置：全量重建（含高度缓存与窗口状态）
+  function renderProcess(state) {
+    // 重建执行流子集（重规划替换 plan 时长度不变，须每次重建）
+    procItems = [];
+    state.timelineEvents.forEach(function (item) {
+      if (item.kind === "plan" || item.kind === "tool" || item.kind === "reflection") {
+        ensureUid(item);
+        procItems.push(item);
+      }
+    });
+
+    // 会话重置：全量重建（含高度缓存与窗口状态）
+    if (!procItems.length) {
       listBox.innerHTML = "";
       listBox.appendChild(spacerTop);
       listBox.appendChild(spacerBottom);
-      itemH = [];
+      itemH = {};
       windowStart = 0;
       windowEnd = -1;
     }
 
-    // 移除旧的 thinking 指示
-    var oldThinking = listBox.querySelector("[data-thinking]");
-    if (oldThinking) { oldThinking.remove(); }
-
-    if (items.length > VIRTUALIZE_THRESHOLD) {
+    if (procItems.length > VIRTUALIZE_THRESHOLD) {
       // 虚拟化模式：贴底时先滚到末尾坐标，再渲染当前窗口
       renderWindow();
-      if (state.running) { listBox.appendChild(elThinking()); }
-      autoScroll();
-      return;
+    } else if (procItems.length) {
+      reconcile(procItems);
+      spacerTop.style.height = "0px";
+      spacerBottom.style.height = "0px";
     }
 
-    // 简单模式：尾部增量追加（高度缓存同步维护，避免模式切换时错位）
-    for (var i = itemH.length; i < items.length; i++) {
-      var node = elItemFor(items[i]);
-      if (node) {
-        node.dataset.timelineIdx = String(i);
-        listBox.insertBefore(node, spacerBottom);
-        measureNode(node, i);
-      } else {
-        itemH[i] = EST_H.error; // 未知类型占位高度
-      }
-    }
-    if (itemH.length > items.length) { itemH.length = items.length; }
+    // 空态占位 + 运行中指示
+    var empty = listBox.querySelector("[data-proc-empty]");
+    if (!procItems.length && !empty) { listBox.appendChild(elProcEmpty()); }
+    if (procItems.length && empty) { empty.remove(); }
+    var oldThinking = listBox.querySelector("[data-thinking]");
+    if (oldThinking) { oldThinking.remove(); }
+    if (state.running && procItems.length) { listBox.appendChild(elProcThinking()); }
 
-    // 运行中显示 thinking 尾巴
-    if (state.running) { listBox.appendChild(elThinking()); }
+    autoScrollProc();
+  }
 
-    autoScroll();
+  /** 总渲染入口：对话流 + 执行流各自按需更新。 */
+  function render(state) {
+    // 计划卡状态就地刷新（避免整卡重排）
+    if (state.activePlan.length) { updatePlanCard(state.activePlan); }
+    renderChat(state);
+    renderProcess(state);
   }
 
   /** 就地更新工具块：状态/耗时/结果体（tool_end 增量合并后触发）。
@@ -381,6 +489,9 @@
       });
       AgentStore.subscribe("running", render);
     },
-    resetScroll: function () { stickBottom = true; }
+    resetScroll: function () {
+      stickChatBottom = true;
+      stickProcBottom = true;
+    }
   };
 })();

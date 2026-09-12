@@ -69,103 +69,11 @@ body {
 button { font-family: inherit; }
 :focus-visible { outline: none; box-shadow: var(--ring); }
 
-/* ================================================================== 顶栏（墨蓝 Chrome） */
-.topbar {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 13px 26px;
-  color: var(--ink-text);
-  background:
-    linear-gradient(120deg, rgba(47, 107, 255, .16), transparent 42%),
-    radial-gradient(720px 220px at 82% -60%, rgba(0, 184, 217, .28), transparent 70%),
-    linear-gradient(180deg, var(--ink-2), var(--ink));
-  border-bottom: 1px solid rgba(255, 255, 255, .06);
-  box-shadow: 0 1px 0 rgba(255, 255, 255, .04) inset, 0 8px 28px -12px rgba(15, 20, 40, .55);
-}
-/* 顶部细网格纹理（装饰层） */
-.topbar::before {
-  content: "";
-  position: absolute; inset: 0; pointer-events: none;
-  background-image:
-    linear-gradient(rgba(255, 255, 255, .035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, .035) 1px, transparent 1px);
-  background-size: 34px 34px;
-  mask-image: linear-gradient(180deg, rgba(0,0,0,.9), transparent 130%);
-  -webkit-mask-image: linear-gradient(180deg, rgba(0,0,0,.9), transparent 130%);
-}
-.topbar > * { position: relative; }
-
-.brand { display: flex; align-items: center; gap: 13px; }
-
-.logo {
-  display: flex; align-items: center; justify-content: center;
-  width: 42px; height: 42px; border-radius: 12px;
-  background: var(--grad-accent);
-  font-size: 21px; font-weight: 800; color: #fff;
-  box-shadow: 0 6px 18px -4px rgba(47, 107, 255, .65), 0 0 0 1px rgba(255, 255, 255, .18) inset;
-}
-
-.brand h1 {
-  margin: 0; font-size: 19px; font-weight: 700; letter-spacing: .3px;
-}
-.tag { margin: 3px 0 0; font-size: 11.5px; color: var(--ink-muted); letter-spacing: .02em; }
-.meta { font-size: 12px; color: var(--ink-muted); }
+/* ================================================================== 顶栏
+ * 旧墨蓝顶栏已下线：品牌移入左侧边栏，Agent 状态灯移入主区顶条
+ * （见 workspace.css 的 .sidebar / .main-header）。 */
 
 .header-right { display: flex; align-items: center; gap: 10px; }
-
-/* -------------------------------------------------- 顶栏玻璃药丸按钮（通用基座） */
-.agent-status,
-.model-pill,
-.settings-btn,
-.header-drop-btn,
-.user-btn {
-  border: 1px solid var(--ink-line);
-  background: rgba(255, 255, 255, .06);
-  color: var(--ink-text);
-  cursor: pointer;
-  transition: background .16s, border-color .16s, transform .16s, box-shadow .16s;
-}
-.agent-status:hover,
-.model-pill:hover,
-.settings-btn:hover,
-.header-drop-btn:hover,
-.user-btn:hover {
-  background: rgba(255, 255, 255, .13);
-  border-color: rgba(255, 255, 255, .26);
-}
-
-/* -------------------------------------------------- Agent 状态指示灯 */
-.agent-status {
-  display: inline-flex; align-items: center; gap: 7px;
-  padding: 6px 13px; border-radius: 999px; font-size: 12.5px; font-weight: 600;
-  white-space: nowrap;
-}
-.agent-status-dot { width: 8px; height: 8px; border-radius: 50%; background: #9aa3b8; transition: background .2s; }
-.agent-status.idle .agent-status-dot { background: #8f9ab5; }
-.agent-status.planning .agent-status-dot { background: #ffc53d; box-shadow: 0 0 8px rgba(255, 197, 61, .9); }
-.agent-status.executing .agent-status-dot { background: #22d3ee; box-shadow: 0 0 8px rgba(34, 211, 238, .9); animation: pulse 1.2s infinite; }
-.agent-status.awaiting .agent-status-dot { background: #f06595; box-shadow: 0 0 8px rgba(240, 101, 149, .9); }
-@keyframes pulse { 50% { opacity: .35; } }
-
-/* -------------------------------------------------- Header 下拉面板 */
-.header-dropdown { position: relative; }
-.header-drop-btn {
-  border-radius: 999px; padding: 6px 13px; font-size: 12.5px; white-space: nowrap;
-}
-.header-drop-btn[aria-expanded="true"] {
-  background: rgba(255, 255, 255, .2); border-color: rgba(255, 255, 255, .3);
-}
-.header-panel {
-  position: absolute; right: 0; top: calc(100% + 10px); width: 350px; max-width: 88vw;
-  background: var(--card); color: var(--text);
-  border: 1px solid var(--border); border-radius: var(--radius);
-  box-shadow: var(--shadow-pop); z-index: 60; overflow: hidden;
-  animation: pop-in .16s ease-out;
-}
-@keyframes pop-in { from { opacity: 0; transform: translateY(-5px) scale(.985); } to { opacity: 1; transform: none; } }
 .hp-head {
   padding: 11px 15px; font-size: 11px; font-weight: 700; color: var(--muted);
   border-bottom: 1px solid var(--border); background: var(--card-soft);
@@ -210,57 +118,9 @@ button { font-family: inherit; }
 }
 .thread-item .t-del:hover { color: var(--danger); background: var(--danger-soft); }
 
-/* -------------------------------------------------- 模型状态指示 */
-.model-indicator { max-width: 240px; }
-.model-pill {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 6px 13px; font-size: 12.5px;
-  border-radius: 999px; max-width: 240px; white-space: nowrap;
-}
-.model-pill span#model-indicator-text { overflow: hidden; text-overflow: ellipsis; }
-.model-dot {
-  width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
-  background: #2fd28a; box-shadow: 0 0 8px rgba(47, 210, 138, .9);
-}
-.model-dot.off { background: #ffc53d; box-shadow: 0 0 8px rgba(255, 197, 61, .9); }
-.caret { font-size: 10px; opacity: .7; }
+/* -------------------------------------------------- 模型状态指示 / 设置入口 / 用户中心
+ * 已迁移：模型选择移入底部输入条，设置与用户中心移入左侧边栏（见 workspace.css）。 */
 
-/* -------------------------------------------------- 设置入口 */
-.settings-btn {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 6px 13px; font-size: 12.5px; border-radius: 999px; white-space: nowrap;
-}
-
-/* -------------------------------------------------- 用户中心 */
-.user-center { position: relative; }
-.user-btn {
-  display: flex; align-items: center; gap: 10px;
-  padding: 5px 12px 5px 5px; border-radius: 999px;
-}
-.avatar {
-  display: flex; align-items: center; justify-content: center;
-  width: 33px; height: 33px; border-radius: 50%; flex: 0 0 auto;
-  background: var(--grad-accent);
-  font-size: 14px; font-weight: 700; color: #fff;
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, .18);
-}
-.user-meta { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.25; }
-.user-name { font-size: 13px; font-weight: 600; }
-.user-roles {
-  font-size: 10.5px; color: #c9d6ff;
-  background: rgba(47, 107, 255, .3);
-  border: 1px solid rgba(96, 140, 255, .5);
-  border-radius: 999px; padding: 0 8px;
-}
-
-.user-menu {
-  position: absolute; right: 0; top: calc(100% + 10px); z-index: 60;
-  width: 252px; padding: 6px;
-  background: var(--card); color: var(--text);
-  border: 1px solid var(--border); border-radius: var(--radius);
-  box-shadow: var(--shadow-pop);
-  animation: pop-in .16s ease-out;
-}
 .menu-id { padding: 10px 12px 8px; }
 .mi-name { font-size: 14px; font-weight: 700; }
 .mi-sub { margin-top: 3px; font-size: 11.5px; color: var(--muted); }
@@ -279,50 +139,8 @@ button { font-family: inherit; }
 
 .container { max-width: 1280px; margin: 0 auto; padding: 22px; }
 
-/* ================================================================== Command Bar */
-.command-bar { margin-bottom: 14px; }
-.command-inner {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 10px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
-  transition: border-color .18s, box-shadow .18s;
-}
-.command-inner:focus-within {
-  border-color: rgba(47, 107, 255, .55);
-  box-shadow: var(--shadow-card), var(--ring);
-}
-.command-divider { width: 1px; align-self: stretch; margin: 4px 0; background: var(--border); }
-
-#query {
-  flex: 1; padding: 12px 14px; font-size: 15px;
-  border: none; outline: none; background: transparent;
-}
-#query::placeholder { color: var(--faint); }
-#query:focus { box-shadow: none; }
-
-#run {
-  padding: 11px 26px; border: none; border-radius: 10px; cursor: pointer;
-  background: var(--grad-accent); color: #fff; font-size: 14.5px; font-weight: 600;
-  white-space: nowrap;
-  box-shadow: 0 6px 16px -4px rgba(47, 107, 255, .5);
-  transition: transform .15s, box-shadow .15s, filter .15s;
-}
-#run:hover { filter: brightness(1.06); transform: translateY(-1px); box-shadow: 0 8px 20px -4px rgba(47, 107, 255, .55); }
-#run:active { transform: translateY(0); }
-#run:disabled { opacity: .6; cursor: default; transform: none; }
-
-/* 模型切换器（Command Bar 左侧，一体化） */
-.model-switch {
-  padding: 10px 12px; font-size: 13px; color: var(--text);
-  max-width: 260px;
-  border: 1px solid var(--border); border-radius: 10px;
-  background: var(--card-soft); outline: none; cursor: pointer;
-  transition: border-color .15s;
-}
-.model-switch:focus { border-color: var(--accent); box-shadow: var(--ring); }
+/* ================================================================== 底部输入条
+ * 旧顶部 Command Bar 已下线：输入条移至对话视图底部（见 workspace.css 的 .composer）。 */
 
 /* -------------------------------------------------- 模型引导横幅 */
 .model-banner {
@@ -435,11 +253,6 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 @media (max-width: 980px) {
   .workspace { grid-template-columns: 1fr; }
-}
-@media (max-width: 900px) {
-  .command-inner { flex-direction: column; align-items: stretch; }
-  .command-divider { display: none; }
-  .tag { display: none; }
 }
 
 /* ================================================================== 设置弹窗 */

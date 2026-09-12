@@ -9,155 +9,243 @@
   <link rel="stylesheet" href="/static/workspace.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="logo">D</span>
-      <div>
-        <h1>DataAgent</h1>
-        <p class="tag">Spec-Driven Data Agent · 自然语言 → DSL → 确定性 SQL → 多步分析 → 报告</p>
-      </div>
-    </div>
+  <div id="app-shell" class="app-shell">
 
-    <div class="header-right">
-      <!-- Agent 状态指示灯：Idle / Planning / Executing / Awaiting User -->
-      <div id="agent-status" class="agent-status idle" title="Agent 当前状态">
-        <span id="agent-status-dot" class="agent-status-dot" aria-hidden="true"></span>
-        <span id="agent-status-text">空闲</span>
-      </div>
-
-      <!-- 知识上下文：DuckDB Schema 选择器（语义目录字段清单） -->
-      <div id="schema-picker" class="header-dropdown">
-        <button type="button" id="schema-btn" class="header-drop-btn"
-                aria-haspopup="true" aria-expanded="false" title="知识上下文：语义目录字段清单">▣ Schema</button>
-        <div id="schema-panel" class="header-panel hidden" aria-label="DuckDB Schema">
-          <div class="hp-head">语义目录 · 可查询字段</div>
-          <div id="schema-panel-body" class="hp-body"><div class="hp-empty">加载中…</div></div>
-        </div>
-      </div>
-
-      <!-- 会话历史 / 新线程 CTA -->
-      <div id="thread-picker" class="header-dropdown">
-        <button type="button" id="new-thread-btn" class="header-drop-btn" title="开启新分析线程（重置工作区）">＋ 新线程</button>
-        <button type="button" id="thread-history-btn" class="header-drop-btn"
-                aria-haspopup="true" aria-expanded="false" title="会话历史">⏱ 历史</button>
-        <div id="thread-panel" class="header-panel hidden" aria-label="会话历史">
-          <div class="hp-head">会话历史（本机）</div>
-          <div id="thread-panel-body" class="hp-body"><div class="hp-empty">暂无历史会话</div></div>
-        </div>
-      </div>
-
-      <!-- 轻量级模型状态指示（纯信息展示；供应商配置统一入口在「设置」） -->
-      <div id="model-indicator" class="model-indicator"
-           title="当前生效模型（可在查询栏切换；供应商在「设置」中配置）">
-        <span id="model-pill" class="model-pill">
-          <span id="model-dot" class="model-dot off" aria-hidden="true"></span>
-          <span id="model-indicator-text">默认模型</span>
+    <!-- ======================================================== 左侧边栏：导航 / 历史 / 设置 / 用户 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="side-brand">
+        <span class="side-logo" aria-hidden="true">
+          <!-- 图标：Lucide "bot"（ISC License，https://lucide.dev） -->
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/>
+            <path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>
+          </svg>
         </span>
+        <div class="side-brand-meta">
+          <h1>DataAgent</h1>
+          <p>Spec-Driven Data Agent</p>
+        </div>
       </div>
 
-      <!-- 常驻设置入口：模型供应商等系统配置统一收纳于此 -->
-      <button type="button" id="settings-btn" class="settings-btn"
-              title="模型供应商设置" aria-haspopup="dialog">⚙ 设置</button>
+      <button type="button" id="new-thread-btn" class="side-new" title="开启新分析线程（重置工作区）">
+        <!-- Lucide "plus" -->
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+        <span class="side-label">新对话</span>
+      </button>
 
-      <!-- 用户中心：头像 + 用户名 + 角色标签 + 下拉菜单 -->
-      <div id="user-center" class="user-center">
-        <button type="button" id="user-menu-btn" class="user-btn" aria-haspopup="menu"
-                aria-expanded="false" title="账号菜单">
-          <span id="user-avatar" class="avatar" aria-hidden="true">·</span>
-          <span class="user-meta">
-            <span id="display-name" class="user-name">—</span>
-            <span id="user-roles" class="user-roles">—</span>
-          </span>
-          <span class="caret" aria-hidden="true">▾</span>
+      <!-- 视图切换：主区在「对话」与四类产物视图之间切换 -->
+      <nav class="side-nav" aria-label="视图切换">
+        <button type="button" class="side-nav-item active" data-view="chat">
+          <!-- Lucide "message-square" -->
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+          <span class="side-label">对话</span>
+          <span id="nav-chat-dot" class="nav-dot hidden" title="等待你的输入"></span>
         </button>
-        <div id="user-menu" class="user-menu hidden" role="menu" aria-label="用户菜单">
-          <div class="menu-id">
-            <div id="menu-display-name" class="mi-name">—</div>
-            <div id="menu-principal" class="mi-sub">—</div>
+        <button type="button" class="side-nav-item" data-view="report">
+          <!-- Lucide "file-text" -->
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/>
+            <path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>
+          </svg>
+          <span class="side-label">执行报告</span>
+          <em id="badge-report" class="nav-badge hidden"></em>
+        </button>
+        <button type="button" class="side-nav-item" data-view="charts">
+          <!-- Lucide "chart-column" -->
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>
+          </svg>
+          <span class="side-label">图表</span>
+          <em id="badge-charts" class="nav-badge hidden"></em>
+        </button>
+        <button type="button" class="side-nav-item" data-view="code">
+          <!-- Lucide "code" -->
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
+          </svg>
+          <span class="side-label">代码沙箱</span>
+          <em id="badge-code" class="nav-badge hidden"></em>
+        </button>
+        <button type="button" class="side-nav-item" data-view="data">
+          <!-- Lucide "table" -->
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/>
+            <path d="M3 9h18"/><path d="M3 15h18"/>
+          </svg>
+          <span class="side-label">数据审计</span>
+          <em id="badge-data" class="nav-badge hidden"></em>
+        </button>
+      </nav>
+
+      <!-- 会话历史（本机最近 20 条） -->
+      <div class="side-history">
+        <div class="side-section-head">会话历史</div>
+        <div id="thread-list" class="thread-list">
+          <div class="hp-empty">暂无历史会话</div>
+        </div>
+      </div>
+
+      <!-- 侧边栏底部：知识目录 / 设置 / 用户中心 -->
+      <div class="side-foot">
+        <div class="side-pop-anchor">
+          <button type="button" id="schema-btn" class="side-foot-btn"
+                  aria-haspopup="true" aria-expanded="false" title="知识上下文：语义目录字段清单">
+            <!-- Lucide "book-open" -->
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 7v14"/>
+              <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>
+            </svg>
+            <span class="side-label">知识目录</span>
+          </button>
+          <div id="schema-panel" class="side-pop hidden" aria-label="DuckDB Schema">
+            <div class="hp-head">语义目录 · 可查询字段</div>
+            <div id="schema-panel-body" class="hp-body"><div class="hp-empty">加载中…</div></div>
           </div>
-          <div class="menu-sep"></div>
-          <button type="button" class="menu-item" id="menu-profile" role="menuitem">
-            <span class="mi-icon" aria-hidden="true">👤</span>用户资料与权限
+        </div>
+        <button type="button" id="settings-btn" class="side-foot-btn"
+                title="模型供应商设置" aria-haspopup="dialog">
+          <!-- Lucide "settings" -->
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+          <span class="side-label">设置</span>
+        </button>
+
+        <div id="user-center" class="user-center">
+          <button type="button" id="user-menu-btn" class="user-btn" aria-haspopup="menu"
+                  aria-expanded="false" title="账号菜单">
+            <span id="user-avatar" class="avatar" aria-hidden="true">·</span>
+            <span class="user-meta">
+              <span id="display-name" class="user-name">—</span>
+              <span id="user-roles" class="user-roles">—</span>
+            </span>
+            <span class="caret" aria-hidden="true">▾</span>
           </button>
-          <button type="button" class="menu-item" id="menu-model-settings" role="menuitem">
-            <span class="mi-icon" aria-hidden="true">⚙</span>模型供应商设置
-          </button>
-          <div class="menu-sep"></div>
-          <button type="button" class="menu-item danger" id="menu-logout" role="menuitem">
-            <span class="mi-icon" aria-hidden="true">⏻</span>退出登录
-          </button>
+          <div id="user-menu" class="user-menu hidden" role="menu" aria-label="用户菜单">
+            <div class="menu-id">
+              <div id="menu-display-name" class="mi-name">—</div>
+              <div id="menu-principal" class="mi-sub">—</div>
+            </div>
+            <div class="menu-sep"></div>
+            <button type="button" class="menu-item" id="menu-profile" role="menuitem">
+              <span class="mi-icon" aria-hidden="true">👤</span>用户资料与权限
+            </button>
+            <button type="button" class="menu-item" id="menu-model-settings" role="menuitem">
+              <span class="mi-icon" aria-hidden="true">⚙</span>模型供应商设置
+            </button>
+            <div class="menu-sep"></div>
+            <button type="button" class="menu-item danger" id="menu-logout" role="menuitem">
+              <span class="mi-icon" aria-hidden="true">⏻</span>退出登录
+            </button>
+          </div>
         </div>
       </div>
-    </div>
-  </header>
+    </aside>
 
-  <main class="workspace-root">
-    <!-- 顶部 Command Bar：模型切换 + 自然语言提问 + 提交 -->
-    <section class="command-bar">
-      <div class="command-inner">
-        <select id="model-switch" class="model-switch"
-                title="切换本次查询使用的模型供应商与模型">
-          <option value="">默认模型（自动选择）</option>
-        </select>
-        <span class="command-divider" aria-hidden="true"></span>
-        <input id="query" type="text" class="command-input"
-               placeholder="用自然语言提问，Agent 将自动规划取数、沙箱分析并生成报告"
-               value="分析一下 2024 年 5 月第一周比第二周 GMV 下滑的原因，按地区定位" autocomplete="off">
-        <button id="run" type="button" class="command-run">开始分析</button>
-      </div>
-    </section>
-
-    <!-- 未配置可用模型时的轻量引导横幅 -->
-    <section id="model-banner" class="model-banner hidden">
-      <span class="mb-text">尚未配置可用模型，</span>
-      <button type="button" id="goto-model-settings" class="mb-link">前往配置模型 →</button>
-    </section>
-
-    <section id="error" class="error hidden"></section>
-
-    <!-- 双栏工作区：左 = 执行与对话流（40%）；右 = 产物画布（60%） -->
-    <section class="split-workspace">
-      <!-- 左栏：AgentChatStream -->
-      <div id="stream-pane" class="stream-pane">
-        <div id="stream-scroll" class="stream-scroll">
-          <div id="stream" class="stream"></div>
+    <!-- ======================================================== 主内容区：对话 / 产物视图 -->
+    <main class="main-area">
+      <header class="main-header">
+        <div id="agent-status" class="agent-status idle" title="Agent 当前状态">
+          <span id="agent-status-dot" class="agent-status-dot" aria-hidden="true"></span>
+          <span id="agent-status-text">空闲</span>
         </div>
-      </div>
-
-      <!-- 右栏：ArtifactCanvas（多标签页） -->
-      <div class="canvas-pane">
-        <div class="canvas-tabs" role="tablist">
-          <button type="button" class="canvas-tab active" data-tab="report" role="tab">执行报告</button>
-          <button type="button" class="canvas-tab" data-tab="charts" role="tab">图表</button>
-          <button type="button" class="canvas-tab" data-tab="code" role="tab">代码沙箱</button>
-          <button type="button" class="canvas-tab" data-tab="data" role="tab">数据审计</button>
-          <span class="spacer"></span>
+        <div id="view-title" class="main-title">对话</div>
+        <span class="spacer"></span>
+        <div id="export-row" class="export-row hidden">
           <button type="button" id="export-md" class="mini-btn" title="导出 Markdown 报告">⬇ Markdown</button>
           <button type="button" id="export-html" class="mini-btn" title="导出 HTML 报告">⬇ HTML</button>
         </div>
-        <div class="canvas-body">
-          <div id="tab-report" class="canvas-view active" role="tabpanel">
+        <button type="button" id="process-toggle" class="mini-btn" title="显示 / 隐藏右侧执行流程">
+          <!-- Lucide "panel-right" -->
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/>
+          </svg>
+          执行流程
+        </button>
+      </header>
+
+      <!-- 未配置可用模型时的轻量引导横幅 -->
+      <section id="model-banner" class="model-banner hidden">
+        <span class="mb-text">尚未配置可用模型，</span>
+        <button type="button" id="goto-model-settings" class="mb-link">前往配置模型 →</button>
+      </section>
+
+      <section id="error" class="error hidden"></section>
+
+      <div class="main-body">
+        <!-- 对话视图：纯对话流 + 底部输入条（模型选择在输入框右侧） -->
+        <section id="view-chat" class="main-view active">
+          <div id="chat-scroll" class="chat-scroll">
+            <div id="chat-stream" class="chat-stream"></div>
+          </div>
+          <div class="composer-wrap">
+            <div class="composer">
+              <input id="query" type="text" class="command-input"
+                     placeholder="用自然语言提问，Agent 将自动规划取数、沙箱分析并生成报告"
+                     value="分析一下 2024 年 5 月第一周比第二周 GMV 下滑的原因，按地区定位" autocomplete="off">
+              <select id="model-switch" class="model-switch"
+                      title="切换本次查询使用的模型供应商与模型">
+                <option value="">默认模型（自动选择）</option>
+              </select>
+              <button id="run" type="button" class="command-run">开始分析</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 产物视图：执行报告 / 图表 / 代码沙箱 / 数据审计（经侧边栏切换） -->
+        <section id="view-report" class="main-view artifact-view">
+          <div class="canvas-scroll">
             <div id="report-empty" class="canvas-empty">Agent 运行后，这里展示执行摘要与归因报告。</div>
             <div id="report-content" class="report-content hidden"></div>
           </div>
-          <div id="tab-charts" class="canvas-view" role="tabpanel">
+        </section>
+        <section id="view-charts" class="main-view artifact-view">
+          <div class="canvas-scroll">
             <div id="charts-empty" class="canvas-empty">Agent 生成的交互式图表将展示在这里。</div>
             <div id="charts-content" class="charts-content hidden"></div>
           </div>
-          <div id="tab-code" class="canvas-view" role="tabpanel">
+        </section>
+        <section id="view-code" class="main-view artifact-view">
+          <div class="canvas-scroll">
             <div id="code-empty" class="canvas-empty">Agent 编写的沙箱分析代码与运行输出将展示在这里。</div>
             <div id="code-content" class="code-content hidden"></div>
           </div>
-          <div id="tab-data" class="canvas-view" role="tabpanel">
+        </section>
+        <section id="view-data" class="main-view artifact-view">
+          <div class="canvas-scroll">
             <div id="data-empty" class="canvas-empty">各取数步骤返回的数据切片将展示在这里。</div>
             <div id="data-content" class="data-content hidden"></div>
           </div>
-        </div>
-      </div>
-    </section>
-  </main>
+        </section>
 
-  <!-- 模型供应商设置弹窗（左右两栏：列表 + 详情表单；仅从用户菜单触发） -->
+        <!-- 右侧：执行流程（任务 DAG / 工具调用 / 反思自愈） -->
+        <aside id="process-pane" class="process-pane">
+          <div class="process-head">
+            <span>执行流程</span>
+            <button type="button" id="process-hide" class="process-hide" title="收起执行流程">»</button>
+          </div>
+          <div id="stream-scroll" class="stream-scroll">
+            <div id="stream" class="stream"></div>
+          </div>
+        </aside>
+      </div>
+    </main>
+  </div>
+
+  <!-- 模型供应商设置弹窗（左右两栏：列表 + 详情表单；入口在侧边栏底部） -->
   <div id="settings-modal" class="modal-backdrop hidden">
     <div class="modal">
       <div class="modal-head">
@@ -236,7 +324,7 @@
   <script src="/static/js/stream.js"></script>
   <script src="/static/js/stream-ui.js"></script>
   <script src="/static/js/canvas.js"></script>
-  <script src="/static/js/header-ui.js"></script>
+  <script src="/static/js/sidebar-ui.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

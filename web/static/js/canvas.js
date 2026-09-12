@@ -1,14 +1,15 @@
-/* 右栏产物画布（ArtifactCanvas）：四 Tab 工作区 + 导出。
+/* 产物渲染（AgentCanvas）：四视图内容 + 导出。
  *
- * Tab：执行报告（Markdown）/ 图表（ECharts 交互 + PNG 导出）/
- *      代码沙箱（Prism 高亮 + stdout）/ 数据审计（分块滚动表格）。
+ * 视图：执行报告（Markdown）/ 图表（ECharts 交互 + PNG 导出）/
+ *       代码沙箱（Prism 高亮 + stdout）/ 数据审计（分块滚动表格）。
+ * 视图切换由侧边栏（sidebar-ui.js）负责，本模块只负责内容渲染与导出；
  * 渲染模型：store.currentArtifacts 变更时全量重绘（产物量级小）；
- * ECharts 实例池按 chartKey 复用，重绘前 dispose 防泄漏。
+ * ECharts 实例池按 host 复用，重绘前 dispose 防泄漏。
  */
 (function () {
   "use strict";
 
-  var charts = []; // [{chartKey, instance}]
+  var charts = []; // [{instance, el}]
   var COLORS = ["#4f6ef7", "#22b8cf", "#12b886", "#f59f00", "#e64980", "#845ef7", "#74b816", "#f76707"];
 
   function $(id) { return document.getElementById(id); }
@@ -26,25 +27,9 @@
     charts = [];
   }
 
-  // ------------------------------------------------------------ Tab 切换
-  function bindTabs() {
-    document.querySelectorAll(".canvas-tab").forEach(function (tab) {
-      tab.addEventListener("click", function () {
-        document.querySelectorAll(".canvas-tab").forEach(function (t) { t.classList.remove("active"); });
-        document.querySelectorAll(".canvas-view").forEach(function (v) { v.classList.remove("active"); });
-        tab.classList.add("active");
-        $("tab-" + tab.dataset.tab).classList.add("active");
-        // 图表 Tab 激活时 resize（隐藏容器初始化尺寸为 0 的情况）
-        if (tab.dataset.tab === "charts") {
-          charts.forEach(function (c) { try { c.instance.resize(); } catch (e) { /* 忽略 */ } });
-        }
-      });
-    });
-  }
-
-  function showTab(name) {
-    var tab = document.querySelector('.canvas-tab[data-tab="' + name + '"]');
-    if (tab) { tab.click(); }
+  /** 图表视图激活时调用：隐藏容器初始化尺寸为 0 的兜底。 */
+  function resizeCharts() {
+    charts.forEach(function (c) { try { c.instance.resize(); } catch (e) { /* 忽略 */ } });
   }
 
   // ------------------------------------------------------------ 报告 Tab
@@ -208,20 +193,18 @@
 
   window.AgentCanvas = {
     init: function () {
-      bindTabs();
       $("export-md").addEventListener("click", exportMarkdown);
       $("export-html").addEventListener("click", exportHtml);
       AgentStore.subscribe("currentArtifacts", function (state) {
         render(state.currentArtifacts);
       });
     },
-    /** 新一轮开始：清空产物 + 回到报告 Tab。 */
+    /** 新一轮开始：清空产物。视图切换由侧边栏负责。 */
     reset: function () {
       AgentStore.get().currentArtifacts = { reports: [], charts: [], codes: [], tables: [] };
       disposeCharts();
       render(AgentStore.get().currentArtifacts);
-      showTab("report");
     },
-    showTab: showTab
+    resizeCharts: resizeCharts
   };
 })();
