@@ -167,14 +167,6 @@
           <button type="button" id="export-md" class="mini-btn" title="导出 Markdown 报告">⬇ Markdown</button>
           <button type="button" id="export-html" class="mini-btn" title="导出 HTML 报告">⬇ HTML</button>
         </div>
-        <button type="button" id="process-toggle" class="mini-btn" title="显示 / 隐藏右侧执行流程">
-          <!-- Lucide "panel-right" -->
-          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-               stroke-linecap="round" stroke-linejoin="round">
-            <rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/>
-          </svg>
-          执行流程
-        </button>
       </header>
 
       <!-- 未配置可用模型时的轻量引导横幅 -->
@@ -186,7 +178,7 @@
       <section id="error" class="error hidden"></section>
 
       <div class="main-body">
-        <!-- 对话视图：纯对话流 + 底部输入条（模型选择在输入框右侧） -->
+        <!-- 对话视图：用户气泡 + Agent 活动时间线（任务计划/工具调用/反思自愈）+ 底部输入条 -->
         <section id="view-chat" class="main-view active">
           <div id="chat-scroll" class="chat-scroll">
             <div id="chat-stream" class="chat-stream"></div>
@@ -230,17 +222,6 @@
             <div id="data-content" class="data-content hidden"></div>
           </div>
         </section>
-
-        <!-- 右侧：执行流程（任务 DAG / 工具调用 / 反思自愈） -->
-        <aside id="process-pane" class="process-pane">
-          <div class="process-head">
-            <span>执行流程</span>
-            <button type="button" id="process-hide" class="process-hide" title="收起执行流程">»</button>
-          </div>
-          <div id="stream-scroll" class="stream-scroll">
-            <div id="stream" class="stream"></div>
-          </div>
-        </aside>
       </div>
     </main>
   </div>

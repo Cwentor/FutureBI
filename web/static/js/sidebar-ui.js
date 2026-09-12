@@ -6,8 +6,7 @@
  * - 产物徽标：各产物视图的条目计数（新产物入账即亮起）；
  * - 知识目录：语义目录字段清单（懒加载弹出面板）；
  * - 会话历史：本机 localStorage 最近 20 条，点击回填输入框并回到对话视图；
- * - 新对话：中断当前流并重置工作区（store/对话流/执行流/画布/徽标）；
- * - 执行流程栏收起/展开。
+ * - 新对话：中断当前流并重置工作区（store/对话流/画布/徽标）。
  */
 (function () {
   "use strict";
@@ -182,11 +181,6 @@
     closeSchema();
   }
 
-  // ---------------------------------------------------------------- 执行流程栏
-  function toggleProcessPane() {
-    document.getElementById("app-shell").classList.toggle("process-hidden");
-  }
-
   // ---------------------------------------------------------------- 入口
   function init() {
     // 视图切换
@@ -216,13 +210,6 @@
     });
 
     document.getElementById("new-thread-btn").addEventListener("click", newThread);
-    document.getElementById("process-hide").addEventListener("click", toggleProcessPane);
-    document.getElementById("process-toggle").addEventListener("click", toggleProcessPane);
-
-    // 窄屏默认收起执行流程（宽屏还原由用户手动控制）
-    if (window.innerWidth <= 1180) {
-      document.getElementById("app-shell").classList.add("process-hidden");
-    }
 
     renderThreads();
   }

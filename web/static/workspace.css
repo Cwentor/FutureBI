@@ -1,10 +1,11 @@
-/* Data Agent 工作台样式（三栏工作台：左导航边栏 + 中对话/产物 + 右执行流程）。
+/* Data Agent 工作台样式（侧边栏 + 单列对话工作台）。
  *
- * 布局：app-shell 横向三栏——
+ * 布局：app-shell 横向两栏——
  *   左 侧边栏（视图切换 / 会话历史 / 知识目录 / 设置 / 用户中心），
- *   中 主区（对话视图 = 纯对话流 + 底部输入条；产物视图 = 报告/图表/代码/审计），
- *   右 执行流程（任务 DAG / 工具调用 / 反思自愈，可收起）。
- * 复用 style.css 的设计令牌（--bg/--card/--accent 等）。
+ *   右 主区（对话视图 = 用户气泡 + Agent 活动时间线 + 底部输入条；
+ *            产物视图 = 报告/图表/代码/审计，经侧边栏切换）。
+ * Agent 的执行过程（任务计划 / 工具调用 / 反思自愈）以时间线活动行形式
+ * 直接融入对话流。复用 style.css 的设计令牌（--bg/--card/--accent 等）。
  */
 
 /* ================================================================== 应用骨架 */
@@ -25,7 +26,7 @@
 
 .main-body {
   flex: 1; min-height: 0;
-  display: flex; overflow: hidden;
+  display: flex; flex-direction: column; overflow: hidden;
 }
 
 .spacer { flex: 1; }
@@ -229,21 +230,6 @@
   display: flex; flex-direction: column; gap: 10px;
 }
 
-/* 对话空态 */
-.chat-empty {
-  margin: 8vh auto 0; text-align: center; color: var(--faint); line-height: 2;
-  animation: fade-in .3s ease-out;
-}
-.chat-empty .ce-icon {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 58px; height: 58px; border-radius: 18px; margin-bottom: 10px;
-  background: var(--card); border: 1px solid var(--border);
-  box-shadow: var(--shadow-card); color: var(--accent);
-}
-.chat-empty .ce-icon svg { width: 28px; height: 28px; }
-.chat-empty .ce-title { font-size: 17px; font-weight: 700; color: var(--muted); }
-.chat-empty .ce-sub { font-size: 13px; }
-
 /* 用户提问气泡 */
 .msg-user {
   align-self: flex-end; max-width: 88%;
@@ -267,14 +253,22 @@
 }
 .done-link:hover { text-decoration: underline; }
 
-/* 对话流运行中指示 */
+/* 对话流运行中指示（时间线末尾的一行） */
 .chat-thinking {
-  align-self: flex-start;
-  display: inline-flex; align-items: center; gap: 8px;
+  align-self: stretch;
+  position: relative;
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 0 4px 26px;
   color: var(--muted); font-size: 12.5px;
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 999px; padding: 7px 14px;
-  box-shadow: var(--shadow-card);
+}
+.chat-thinking::before {
+  content: ""; position: absolute; left: 8px; top: -10px; bottom: 0; width: 2px;
+  background: var(--border);
+}
+.chat-thinking::after {
+  content: ""; position: absolute; left: 4px; top: 10px; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--accent-soft); border: 2px solid var(--accent);
+  animation: spin 1.2s linear infinite;
 }
 .chat-thinking .dots::after { content: "…"; animation: blink 1.2s infinite; }
 @keyframes blink { 50% { opacity: .2; } }
@@ -317,47 +311,69 @@
 }
 .model-switch:focus { border-color: var(--accent); outline: none; box-shadow: var(--ring); }
 
-/* ================================================================== 右侧执行流程 */
-.process-pane {
-  flex: 0 0 400px; width: 400px; min-width: 0;
-  display: flex; flex-direction: column;
-  background: var(--card);
-  border-left: 1px solid var(--border);
-  overflow: hidden;
-}
-.app-shell.process-hidden .process-pane { display: none; }
-.process-head {
-  flex: 0 0 auto;
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-  font-size: 11.5px; font-weight: 700; color: var(--muted);
-  text-transform: uppercase; letter-spacing: .08em;
-}
-.process-hide {
-  border: 1px solid var(--border); background: var(--card); color: var(--muted);
-  border-radius: 7px; width: 24px; height: 24px; cursor: pointer;
-  font-size: 13px; line-height: 1;
-  transition: border-color .15s, color .15s, background .15s;
-}
-.process-hide:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
-
-.stream-scroll { flex: 1; overflow-y: auto; padding: 14px; }
-.stream { display: flex; flex-direction: column; gap: 10px; }
+/* ================================================================== Agent 活动时间线
+ * 执行过程（任务计划 / 工具调用 / 反思自愈）以对话流内的时间线活动行呈现：
+ * 左侧竖线 + 节点圆点贯穿，活动行默认收起、点击展开详情（对标 Agent 对话流样式）。 */
 .virtual-spacer { width: 100%; flex: 0 0 auto; }
 
-/* 流内通用块 */
-.stream-item {
-  border: 1px solid var(--border); border-radius: 11px; background: var(--card); overflow: hidden;
+.act {
+  position: relative;
+  align-self: stretch;
+  padding: 2px 0 2px 26px;
   animation: item-in .22s ease-out;
 }
-.stream-item:hover { border-color: var(--border-strong); }
-@keyframes item-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+/* 竖线（向下延伸 gap 距离，与相邻活动行连成一条） */
+.act::before {
+  content: ""; position: absolute; left: 8px; top: -10px; bottom: -10px; width: 2px;
+  background: var(--border);
+}
+/* 节点圆点 */
+.act::after {
+  content: ""; position: absolute; left: 4px; top: 12px; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--card); border: 2px solid #c9cfdf;
+  transition: border-color .2s, background .2s;
+}
+.act.node-running::after { border-color: var(--accent); background: var(--accent-soft); animation: spin 1.2s linear infinite; }
+.act.node-ok::after { border-color: #12b886; background: #e6fcf5; }
+.act.node-fail::after { border-color: var(--danger); background: var(--danger-soft); }
+.act.node-plan::after { border-color: var(--accent); background: var(--accent-soft); }
+.act-reflect .act-icon { font-size: 12px; }
+.act-reflect.node-ok .act-icon { color: var(--ok); }
+.act-reflect.act-warn .act-icon { color: #d9480f; }
+.act-reflect.act-warn::after { border-color: #f59f00; background: #fff9db; }
 
-/* 步骤时间线 */
-.plan-card { padding: 10px 12px; }
-.plan-title { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 8px; }
-.plan-step { display: flex; align-items: flex-start; gap: 9px; padding: 5px 0; font-size: 13px; line-height: 1.5; }
+/* 活动行头（工具行可点击展开） */
+.act-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 4px 0; border: none; background: none; cursor: pointer; text-align: left;
+  font-size: 12.5px; color: var(--text); font-family: inherit;
+  transition: color .14s;
+}
+button.act-head:hover .act-label { color: var(--accent-dark); }
+.act-chevron { margin-left: auto; color: var(--faint); font-size: 11px; transition: transform .15s; }
+.act.open .act-chevron { transform: rotate(180deg); }
+.act-icon { flex: 0 0 16px; text-align: center; color: var(--muted); font-size: 13px; }
+.act-label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.act-meta { flex: 0 0 auto; color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.act-meta.ok { color: var(--ok); }
+.act-meta.fail { color: var(--danger); }
+.act-meta.grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+
+/* 展开体（DSL / 代码 / 输出） */
+.act-body { display: none; padding: 2px 0 8px; }
+.act.open .act-body { display: block; }
+.act-body h4 { margin: 8px 0 4px; font-size: 11.5px; color: var(--muted); font-weight: 600; }
+.act-body pre {
+  margin: 0; padding: 9px 11px; background: var(--card-soft); border-radius: 8px;
+  border: 1px solid var(--border);
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+  overflow-x: auto; max-height: 320px; overflow-y: auto; white-space: pre;
+}
+.act-err { margin-top: 8px; padding: 8px 11px; background: var(--danger-soft); color: var(--danger); border-radius: 8px; font-size: 12px; }
+
+/* 任务计划节点（默认展开的步骤清单） */
+.act-plan .plan-steps { padding: 2px 0 6px; }
+.plan-step { display: flex; align-items: flex-start; gap: 9px; padding: 4px 0; font-size: 13px; line-height: 1.5; }
 .plan-step .p-icon { flex: 0 0 18px; text-align: center; }
 .plan-step .p-status { margin-left: auto; flex: 0 0 auto; font-size: 11px; padding: 1px 8px; border-radius: 999px; }
 .plan-step[data-status="pending"] .p-icon { color: #b8bfd0; }
@@ -370,46 +386,13 @@
 .plan-step[data-status="failed"] .p-status { background: var(--danger-soft); color: var(--danger); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* 工具调用手风琴 */
-.tool-acc { font-size: 13px; }
-.tool-head {
-  display: flex; align-items: center; gap: 8px; width: 100%;
-  padding: 9px 12px; background: none; border: none; cursor: pointer; text-align: left;
-  font-size: 13px; color: var(--text); font-family: inherit;
-  transition: background .14s;
-}
-.tool-head:hover { background: var(--card-soft); }
-.tool-chevron { margin-left: auto; color: var(--muted); font-size: 11px; transition: transform .15s; }
-.tool-acc.open .tool-chevron { transform: rotate(180deg); }
+/* 工具类型徽标（活动行内） */
 .tool-badge {
-  font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 999px; white-space: nowrap;
+  font-size: 10.5px; font-weight: 700; padding: 1px 8px; border-radius: 999px; white-space: nowrap;
 }
 .tool-badge.dsl { background: var(--accent-soft); color: var(--accent-dark); }
 .tool-badge.sandbox { background: #fff1e2; color: #d9480f; }
 .tool-badge.meta { background: #f1edff; color: #6741d9; }
-.tool-dur { font-size: 11px; color: var(--muted); }
-.tool-state { font-size: 11px; }
-.tool-state.ok { color: var(--ok); }
-.tool-state.fail { color: var(--danger); }
-.tool-body { border-top: 1px dashed var(--border); padding: 10px 12px; display: none; }
-.tool-acc.open .tool-body { display: block; }
-.tool-body h4 { margin: 8px 0 4px; font-size: 11.5px; color: var(--muted); font-weight: 600; }
-.tool-body pre {
-  margin: 0; padding: 9px 11px; background: var(--card-soft); border-radius: 8px;
-  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
-  overflow-x: auto; max-height: 320px; overflow-y: auto; white-space: pre;
-}
-.tool-err { margin-top: 8px; padding: 8px 11px; background: var(--danger-soft); color: var(--danger); border-radius: 8px; font-size: 12px; }
-
-/* 反思 / 自愈节点 */
-.reflection-card {
-  border-left: 3px solid #f59f00; background: #fffdf5; padding: 9px 12px;
-  font-size: 12.5px; line-height: 1.6;
-}
-.reflection-card .r-decision { font-weight: 700; margin-right: 6px; }
-.reflection-card .r-decision.retry, .reflection-card .r-decision.replan { color: #d9480f; }
-.reflection-card .r-decision.proceed { color: var(--ok); }
-.reflection-card .r-reason { color: var(--muted); }
 
 /* HITL 交互卡（渲染在对话流中） */
 .hitl-card {
@@ -438,12 +421,22 @@
 .hitl-answered { font-size: 12.5px; color: var(--ok); padding: 4px 0; }
 .hitl-answered::before { content: "✓ "; }
 
-/* 执行流占位与运行中指示 */
-.stream-empty { color: var(--faint); font-size: 12.5px; text-align: center; padding: 34px 16px; line-height: 1.9; }
-.stream-thinking {
-  display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; padding: 4px 6px;
+/* 对话流占位（时间线空态） */
+.chat-empty {
+  margin: 8vh auto 0; text-align: center; color: var(--faint); line-height: 2;
+  animation: fade-in .3s ease-out;
 }
-.stream-thinking .dots::after { content: "…"; animation: blink 1.2s infinite; }
+.chat-empty .ce-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 58px; height: 58px; border-radius: 18px; margin-bottom: 10px;
+  background: var(--card); border: 1px solid var(--border);
+  box-shadow: var(--shadow-card); color: var(--accent);
+}
+.chat-empty .ce-icon svg { width: 28px; height: 28px; }
+.chat-empty .ce-title { font-size: 17px; font-weight: 700; color: var(--muted); }
+.chat-empty .ce-sub { font-size: 13px; }
+
+@keyframes item-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 /* ================================================================== 产物内容（报告 / 图表 / 代码 / 数据审计） */
 .canvas-empty { color: var(--faint); font-size: 13px; text-align: center; padding: 70px 20px; line-height: 1.9; }
@@ -531,7 +524,7 @@
 .token.operator { color: #171c30; }
 
 /* ================================================================== 响应式降级 */
-/* 窄屏：执行流程默认由 JS 判宽收起（.process-hidden），侧边栏收窄为图标栏 */
+/* 窄屏：侧边栏收窄为图标栏 */
 @media (max-width: 900px) {
   .sidebar { flex-basis: 62px; width: 62px; padding: 12px 8px; align-items: center; }
   .side-brand { justify-content: center; padding: 2px 0 4px; }
